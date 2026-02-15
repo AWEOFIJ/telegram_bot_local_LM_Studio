@@ -120,3 +120,55 @@ async def llm_build_search_query(
         return {"query": q}
     except json.JSONDecodeError:
         return {"query": ""}
+
+
+async def llm_plan_tools(
+    client: LMStudioClient,
+    *,
+    model: str,
+    user_text: str,
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": ["web_search", "none"]},
+            "query": {"type": "string"},
+        },
+        "required": ["tool", "query"],
+        "additionalProperties": False,
+    }
+
+    content = await client.chat_completions(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You can optionally call a tool. Your goal is accuracy. "
+                    "Decide whether web search is necessary for the user's message. "
+                    "Use tool=web_search when ANY of the following is true: "
+                    "(1) the question is time-sensitive (today/latest/current/2024/2025/2026/news/prices/releases), "
+                    "(2) the answer needs verification, factual precision, or citations, "
+                    "(3) the user asks for sources/links, "
+                    "(4) the question is ambiguous and search can disambiguate, "
+                    "(5) you are not highly confident. "
+                    "Only use tool=none for general knowledge, math, coding that doesn't require up-to-date info, or when the user explicitly forbids browsing. "
+                    "If using web_search, craft a concise query with key entities, constraints, and locale if relevant. "
+                    "Reply with JSON only."
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.0,
+        response_format={"type": "json_schema", "json_schema": {"name": "tool_plan", "schema": schema}},
+    )
+
+    try:
+        data = json.loads(content)
+        tool = (data.get("tool") or "none").strip()
+        query = (data.get("query") or "").strip()
+        if tool not in {"web_search", "none"}:
+            tool = "none"
+        return {"tool": tool, "query": query}
+    except json.JSONDecodeError:
+        return {"tool": "none", "query": ""}

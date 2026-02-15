@@ -21,12 +21,12 @@ def load_settings() -> Settings:
 
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     brave_api_key = os.environ.get("BRAVE_API_KEY", "").strip()
-
+ 
     if not telegram_bot_token:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not brave_api_key:
         raise RuntimeError("Missing BRAVE_API_KEY")
-
+ 
     return Settings(
         telegram_bot_token=telegram_bot_token,
         lmstudio_base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1").strip(),
