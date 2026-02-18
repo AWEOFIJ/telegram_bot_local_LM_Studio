@@ -330,6 +330,122 @@ def _has_source_links_block(text: str) -> bool:
     return bool(re.search(r"\n\[[0-9]+\]\s+https?://", text or "", flags=re.IGNORECASE))
 
 
+def _extract_citation_indices(text: str, max_index: int) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for m in re.finditer(r"\[(\d{1,3})\]", text or ""):
+        i = int(m.group(1))
+        if i < 1 or i > max_index:
+            continue
+        if i in seen:
+            continue
+        seen.add(i)
+        out.append(i)
+    return out
+
+
+def _news_has_diverse_citations(text: str, max_index: int) -> bool:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip().startswith(("-", "•", "*"))]
+    if len(lines) < 3:
+        return True
+
+    cited: set[int] = set()
+    for ln in lines:
+        for m in re.finditer(r"\[(\d{1,3})\]", ln):
+            i = int(m.group(1))
+            if 1 <= i <= max_index:
+                cited.add(i)
+    # 至少要有兩個不同來源，避免全部集中在 [1]
+    return len(cited) >= 2
+
+
+def _ensure_bullets(text: str) -> list[str]:
+    raw_lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    bullets = [ln.strip() for ln in raw_lines if ln.strip().startswith(("-", "•", "*"))]
+    if bullets:
+        return bullets
+    return ["- " + ln.strip() for ln in raw_lines[:5] if ln.strip()]
+
+
+async def _deterministic_news_fallback(
+    lm: LMStudioClient,
+    *,
+    model: str,
+    user_text: str,
+    search_results: list[dict],
+    fetched_pages: list[dict],
+    source_date_hints: dict[int, str],
+    max_items: int = 8,
+) -> str:
+    n = min(max_items, len(search_results) if search_results else 0)
+    if n <= 0:
+        return ""
+
+    tasks: list[asyncio.Task[str]] = []
+    for i in range(1, n + 1):
+        sr = search_results[i - 1] if i - 1 < len(search_results) else {}
+        fp = fetched_pages[i - 1] if i - 1 < len(fetched_pages) else {}
+        url = str(sr.get("url") or "")
+        title = str(sr.get("title") or fp.get("title") or "").strip()
+        domain = _domain(url)
+        content = str(fp.get("text") or "").strip()
+        if not content:
+            content = f"Title: {title}\n\nSnippet: {str(sr.get('description') or '').strip()}"
+
+        tasks.append(
+            asyncio.create_task(
+                _summarize_source(
+                    lm,
+                    model=model,
+                    user_text=user_text,
+                    source_index=i,
+                    title=title,
+                    domain=domain,
+                    content=content,
+                )
+            )
+        )
+
+    parts = await asyncio.gather(*tasks, return_exceptions=True)
+
+    bullets: list[str] = []
+    for i, part in enumerate(parts, start=1):
+        if isinstance(part, Exception):
+            continue
+        lines = _ensure_bullets(str(part))
+        if not lines:
+            continue
+        line = lines[0].strip()
+
+        hint = source_date_hints.get(i) or "[未提供日期]"
+        if hint != "[未提供日期]" and not re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", line):
+            if "未提供日期" in line[:40]:
+                line = re.sub(r"\[未提供日期\]", hint, line, count=1)
+            else:
+                line = "- **" + hint + "** " + re.sub(r"^[-•*]\s*", "", line)
+
+        if f"[{i}]" not in line:
+            line = line.rstrip() + f" [{i}]"
+
+        bullets.append(line)
+
+    if not bullets:
+        return ""
+    header = "以下是今天的一些國際要聞摘要："
+    return header + "\n\n" + "\n".join(bullets)
+
+
+def _strip_source_links_block(text: str) -> str:
+    lines = (text or "").splitlines()
+    cut = len(lines)
+    for i, ln in enumerate(lines):
+        l = ln.strip().lower()
+        if any(k in l for k in ["來源連結", "来源链接", "來源鏈接", "source links", "references"]):
+            cut = i
+            break
+    return "\n".join(lines[:cut]).rstrip()
+
+
 def _build_recent_news_fallback(*, user_text: str, search_results: list[dict[str, object]]) -> str:
     lines = [
         "我已查詢最新來源，但目前前幾個來源多為背景頁或歷史內容，無法可靠支持「最近幾天」的具體財經數字。",
@@ -364,6 +480,120 @@ def _news_output_has_date_prefix(text: str) -> bool:
         if "未提供日期" in head:
             continue
         return False
+    return True
+
+
+def _normalize_date_parts(year: int, month: int, day: int) -> str | None:
+    if year < 2000 or year > 2100:
+        return None
+    if month < 1 or month > 12:
+        return None
+    if day < 1 or day > 31:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _extract_date_candidates(text: str) -> list[str]:
+    s = text or ""
+    out: list[str] = []
+
+    # 2026-02-18 / 2026/02/18 / 2026年2月18日
+    for m in re.finditer(r"(20\d{2})\s*[-/年]\s*(\d{1,2})\s*(?:[-/月]\s*(\d{1,2})\s*日?)?", s):
+        y = int(m.group(1))
+        mo = int(m.group(2))
+        d = int(m.group(3) or 1)
+        norm = _normalize_date_parts(y, mo, d)
+        if norm:
+            out.append(norm)
+
+    # February 17, 2026
+    month_map = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    for m in re.finditer(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s*(20\d{2})\b",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        mo = month_map.get((m.group(1) or "").lower(), 0)
+        d = int(m.group(2))
+        y = int(m.group(3))
+        norm = _normalize_date_parts(y, mo, d)
+        if norm:
+            out.append(norm)
+
+    # de-dup keep order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for d in out:
+        if d in seen:
+            continue
+        seen.add(d)
+        uniq.append(d)
+    return uniq
+
+
+def _build_source_date_hints(search_results: list[dict], fetched_pages: list[dict]) -> tuple[dict[int, str], set[str]]:
+    hints: dict[int, str] = {}
+    allowed_dates: set[str] = set()
+
+    max_n = max(len(search_results), len(fetched_pages))
+    for i in range(1, max_n + 1):
+        sr = search_results[i - 1] if i - 1 < len(search_results) else {}
+        fp = fetched_pages[i - 1] if i - 1 < len(fetched_pages) else {}
+
+        text_parts = [
+            str(sr.get("title") or ""),
+            str(sr.get("description") or ""),
+            str(fp.get("title") or ""),
+            str(fp.get("text") or "")[:1500],
+        ]
+        dates: list[str] = []
+        for part in text_parts:
+            dates.extend(_extract_date_candidates(part))
+
+        date_value = dates[0] if dates else "[未提供日期]"
+        hints[i] = date_value
+        if date_value != "[未提供日期]":
+            allowed_dates.add(date_value)
+
+    return hints, allowed_dates
+
+
+def _extract_news_bullet_dates(text: str) -> list[str]:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip().startswith(("-", "•", "*"))]
+    out: list[str] = []
+    for ln in lines:
+        head = ln[:80]
+        if "未提供日期" in head:
+            out.append("[未提供日期]")
+            continue
+        found = _extract_date_candidates(head)
+        if found:
+            out.append(found[0])
+    return out
+
+
+def _news_dates_grounded_in_sources(text: str, allowed_dates: set[str]) -> bool:
+    bullet_dates = _extract_news_bullet_dates(text)
+    if not bullet_dates:
+        return False
+    for d in bullet_dates:
+        if d == "[未提供日期]":
+            continue
+        if d not in allowed_dates:
+            return False
     return True
 
 
@@ -749,6 +979,7 @@ async def run_bot(settings: Settings) -> None:
             ]
         )
         is_recent_news_q = _is_recent_news_query(user_text)
+        source_date_hints, allowed_news_dates = _build_source_date_hints(search_results, fetched_pages)
 
         messages = [
             {
@@ -798,6 +1029,7 @@ async def run_bot(settings: Settings) -> None:
 
                 if is_news:
                     n = min(10, len(search_results) if search_results else 10)
+                    date_hint_lines = [f"[{i}] {source_date_hints.get(i, '[未提供日期]')}" for i in range(1, n + 1)]
                     messages.append(
                         {
                             "role": "system",
@@ -806,6 +1038,9 @@ async def run_bot(settings: Settings) -> None:
                                 f"You MUST list at least {n} distinct news items if sources are available. "
                                 "Return a bullet list. Each bullet must contain: publication date (YYYY-MM-DD, or [未提供日期] if not available), a short headline, a 1-2 sentence summary, and a citation like [n]. "
                                 "The publication date must be placed at the beginning of each bullet. "
+                                "Use only publication dates from the following source-date hints; do NOT invent dates:\n"
+                                + "\n".join(date_hint_lines)
+                                + "\n"
                                 "Each bullet MUST cite a different source index when possible. "
                                 "Do NOT write generic summaries. Do NOT merge multiple news into one bullet."
                             ),
@@ -1004,6 +1239,79 @@ async def run_bot(settings: Settings) -> None:
                     data={"enforced": True},
                 )
 
+        if tool == "web_search" and is_news and search_results and not _news_dates_grounded_in_sources(assistant_text, allowed_news_dates):
+            retry_messages = list(messages)
+            retry_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous dates are invalid because they are not grounded in source-date hints. "
+                        "Rewrite the news bullets and use only allowed dates from source-date hints or [未提供日期]. "
+                        "Do NOT fabricate dates. Keep citations [n]."
+                    ),
+                }
+            )
+            retry_messages.append({"role": "user", "content": user_text})
+            assistant_text = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=retry_messages,
+                temperature=0.1,
+                max_tokens=900,
+                request_id=request_id,
+            )
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="news_date_grounding_retry",
+                    data={"allowed_dates": sorted(allowed_news_dates)},
+                )
+
+        if tool == "web_search" and is_news and search_results and not _news_has_diverse_citations(assistant_text, len(search_results)):
+            retry_messages = list(messages)
+            retry_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous answer overused a single citation index. "
+                        "Rewrite using multiple different citation indices [n] that match the corresponding sources. "
+                        "If multiple sources are available, do not cite only [1]."
+                    ),
+                }
+            )
+            retry_messages.append({"role": "user", "content": user_text})
+            assistant_text = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=retry_messages,
+                temperature=0.1,
+                max_tokens=900,
+                request_id=request_id,
+            )
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="news_citation_diversity_retry",
+                    data={"enforced": True},
+                )
+
+        if tool == "web_search" and is_news and search_results and not _news_has_diverse_citations(assistant_text, len(search_results)):
+            fallback_text = await _deterministic_news_fallback(
+                lm,
+                model=settings.lmstudio_chat_model,
+                user_text=user_text,
+                search_results=search_results,
+                fetched_pages=fetched_pages,
+                source_date_hints=source_date_hints,
+                max_items=min(8, len(search_results)),
+            )
+            if fallback_text.strip():
+                assistant_text = fallback_text.strip()
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="news_deterministic_fallback_applied",
+                    data={"applied": bool(fallback_text.strip())},
+                )
+
         if lang_pref == "zh-Hant" and _looks_simplified_chinese(assistant_text):
             rewrite_messages = [
                 {
@@ -1033,14 +1341,23 @@ async def run_bot(settings: Settings) -> None:
                 )
 
         if tool == "web_search" and is_news and search_results:
-            urls = [(item.get("url") or "").strip() for item in search_results]
-            urls = [u for u in urls if u]
-            if urls and not _has_source_links_block(assistant_text):
-                n = min(10, len(urls))
-                link_lines = [f"[{i}] {urls[i - 1]}" for i in range(1, n + 1)]
+            base_text = _strip_source_links_block(assistant_text)
+            cited = _extract_citation_indices(base_text, len(search_results))
+            if not cited:
+                cited = [i for i in range(1, min(10, len(search_results)) + 1)]
+
+            link_lines: list[str] = []
+            for i in cited[:10]:
+                url = (search_results[i - 1].get("url") or "").strip()
+                if not url:
+                    continue
+                link_lines.append(f"[{i}] {url}")
+
+            assistant_text = base_text
+            if link_lines:
                 assistant_text = assistant_text.rstrip() + "\n\n" + "來源連結：\n" + "\n".join(link_lines)
 
-        if tool == "web_search" and _wants_links(user_text) and search_results:
+        if tool == "web_search" and _wants_links(user_text) and search_results and not is_news:
             urls = [
                 (item.get("url") or "").strip()
                 for item in search_results
