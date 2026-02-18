@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .brave_search import BraveSearchClient
 from .config import Settings
@@ -155,6 +155,83 @@ def _wants_links(user_text: str) -> bool:
         "source",
     ]
     return any(k in t for k in keywords)
+
+
+def _infer_profile_updates(user_text: str) -> dict[str, object]:
+    t = user_text.strip()
+    tl = t.lower()
+    updates: dict[str, object] = {}
+
+    if re.search(r"(以後|之後|請|麻煩).*(繁體|繁中)", t):
+        updates["preferred_language"] = "zh-Hant"
+    elif re.search(r"(以後|之後|請|麻煩).*(簡體|简体|簡中|简中)", t):
+        updates["preferred_language"] = "zh-Hans"
+    elif re.search(r"(以後|之後|請|麻煩).*(英文|english)", tl):
+        updates["preferred_language"] = "en"
+
+    if re.search(r"(以後|之後|都).*(附|給).*(連結|链接|網址|网址|來源|来源|link|url)", tl):
+        updates["prefer_links"] = True
+    elif re.search(r"(以後|之後|都).*(不要|別|不必).*(連結|链接|網址|网址|來源|来源|link|url)", tl):
+        updates["prefer_links"] = False
+
+    return updates
+
+
+def _profile_to_system_prompt(profile: dict[str, object]) -> str:
+    if not profile:
+        return ""
+
+    lines: list[str] = []
+
+    lang = str(profile.get("preferred_language") or "").strip()
+    if lang == "zh-Hant":
+        lines.append("User preference: reply in Traditional Chinese unless user explicitly asks otherwise.")
+    elif lang == "zh-Hans":
+        lines.append("User preference: reply in Simplified Chinese unless user explicitly asks otherwise.")
+    elif lang == "en":
+        lines.append("User preference: reply in English unless user explicitly asks otherwise.")
+
+    default_loc = str(profile.get("default_weather_location") or "").strip()
+    if default_loc:
+        lines.append(f"User default weather location: {default_loc}.")
+
+    prefer_links = profile.get("prefer_links")
+    if isinstance(prefer_links, bool):
+        if prefer_links:
+            lines.append("User preference: include source links when possible.")
+        else:
+            lines.append("User preference: avoid source links unless explicitly requested.")
+
+    if not lines:
+        return ""
+    return "Long-term user preferences:\n- " + "\n- ".join(lines)
+
+
+def _format_profile_text(profile: dict[str, object]) -> str:
+    if not profile:
+        return "目前沒有已儲存的長期記憶偏好。"
+
+    lines: list[str] = []
+
+    lang = str(profile.get("preferred_language") or "").strip()
+    if lang == "zh-Hant":
+        lines.append("- 語言偏好：繁體中文")
+    elif lang == "zh-Hans":
+        lines.append("- 語言偏好：簡體中文")
+    elif lang == "en":
+        lines.append("- 語言偏好：英文")
+
+    default_loc = str(profile.get("default_weather_location") or "").strip()
+    if default_loc:
+        lines.append(f"- 預設天氣地區：{default_loc}")
+
+    prefer_links = profile.get("prefer_links")
+    if isinstance(prefer_links, bool):
+        lines.append(f"- 連結偏好：{'會附上來源連結' if prefer_links else '不主動附上來源連結'}")
+
+    if not lines:
+        return "目前沒有已儲存的長期記憶偏好。"
+    return "目前的長期記憶偏好：\n" + "\n".join(lines)
 
 
 def _is_weather_refusal(text: str) -> bool:
@@ -329,6 +406,25 @@ async def run_bot(settings: Settings) -> None:
     )
     recent: dict[int, deque[dict]] = defaultdict(lambda: deque(maxlen=settings.recent_turns * 2))
 
+    async def on_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        profile = await memory.get_profile(chat_id=chat_id)
+        text = _format_profile_text(profile)
+        await update.message.reply_text(text, disable_web_page_preview=True)
+
+    async def on_forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        cleared = await memory.clear_profile(chat_id=chat_id)
+        if cleared:
+            text = "已清除這個聊天室的長期記憶偏好（profile）。"
+        else:
+            text = "目前沒有可清除的長期記憶偏好。"
+        await update.message.reply_text(text, disable_web_page_preview=True)
+
     async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message or not update.message.text:
             return
@@ -355,6 +451,21 @@ async def run_bot(settings: Settings) -> None:
         recent[chat_id].clear()
         recent[chat_id].extend(persisted)
 
+        profile = await memory.get_profile(chat_id=chat_id)
+        profile_updates = _infer_profile_updates(user_text)
+        if _is_weather_question(user_text):
+            detected_loc = _extract_tw_location(user_text)
+            if detected_loc:
+                profile_updates["default_weather_location"] = _normalize_location(detected_loc)
+        if profile_updates:
+            profile = await memory.upsert_profile(chat_id=chat_id, updates=profile_updates)
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="memory_profile_update",
+                    data={"chat_id": chat_id, "updates": profile_updates, "profile": profile},
+                )
+
         plan = await llm_plan_tools(lm, model=settings.lmstudio_chat_model, user_text=user_text)
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
@@ -375,6 +486,8 @@ async def run_bot(settings: Settings) -> None:
         if tool == "web_search":
             is_weather = _is_weather_question(user_text)
             loc = _extract_tw_location(user_text) if is_weather else ""
+            if is_weather and not loc:
+                loc = str(profile.get("default_weather_location") or "").strip()
             if is_weather and not loc:
                 assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 台中 / 高雄 / 蘇州 / 上海。"
                 if dbg.enabled:
@@ -491,6 +604,9 @@ async def run_bot(settings: Settings) -> None:
                 "content": "You are a helpful Telegram chatbot.",
             },
         ]
+        profile_prompt = _profile_to_system_prompt(profile)
+        if profile_prompt:
+            messages.append({"role": "system", "content": profile_prompt})
 
         if tool == "web_search":
             if search_block:
@@ -648,6 +764,8 @@ async def run_bot(settings: Settings) -> None:
         await update.message.reply_text(assistant_text, disable_web_page_preview=True)
 
     app = Application.builder().token(settings.telegram_bot_token).build()
+    app.add_handler(CommandHandler("memory", on_memory_command))
+    app.add_handler(CommandHandler("forget", on_forget_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     try:

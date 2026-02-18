@@ -4,7 +4,8 @@
 - Telegram 私聊/群組文字對話
 - 透過 LM Studio（OpenAI-compatible）呼叫本機模型
 - bot 端聯網：bot 呼叫 Brave Search API 取得資料，再交給 LM Studio 彙整答案
-- 對話記憶寫入 `memory/YYYY-MM-DD.md`（每日一個檔案）
+- 對話記憶（短期）寫入 `memory/chat_<chat_id>/YYYY-MM-DD.md`（append）
+- 長期偏好記憶（profile）寫入 `memory/chat_<chat_id>/profile.json`，並注入到 LM Studio prompt
 
 ## 需求
 - Windows / macOS / Linux
@@ -58,6 +59,13 @@ python main.py
 - `MEMORY_MODE=daily`：此專案同樣會寫到 `memory/chat_<chat_id>/YYYY-MM-DD.md`（避免不同 chat 混在同一檔）
 - `MEMORY_MODE=per_chat`：寫到 `memory/chat_<chat_id>.md`
 - bot 會讀取（可跨天）最後 N 則訊息作為上下文
+- 另有長期偏好檔：`memory/chat_<chat_id>/profile.json`
+  - 目前會記錄：語言偏好、預設天氣地區、是否偏好附來源連結
+  - 這些偏好會在回覆前注入 system prompt，改善個人化體驗
+
+## 指令
+- `/memory`：查看目前聊天室的長期偏好記憶（profile）
+- `/forget`：清除目前聊天室的長期偏好記憶（profile）
 
 ## 常見問題
 ### 1) 為什麼不需要 `LMSTUDIO_EMBED_MODEL`？
@@ -66,8 +74,11 @@ python main.py
 ### 2) 群組可以用嗎？
 可以。把 bot 拉進群組並給它讀取訊息權限即可。此程式目前會處理所有非指令文字訊息。
 
-### 3) Brave 搜尋結果如何引用？
+### 3) `/memory` 和 `/forget` 會不會刪掉聊天紀錄？
+不會。這兩個指令只操作 `profile.json`（長期偏好），不會刪除 markdown 對話紀錄。
+
+### 4) Brave 搜尋結果如何引用？
   若 bot 判斷需要搜尋，會把搜尋結果以 `[n]` 列表提供給模型，並要求回答時用 `[n]` 引用來源；預設不直接貼 URL（除非使用者明確要求連結）。
 
-### 4) 什麼情況下會傾向使用 `web_search`？
+### 5) 什麼情況下會傾向使用 `web_search`？
 此專案目前採「偏準確」策略：只要涉及時效性、需要驗證/來源、問題不夠明確或模型不夠有把握，就會傾向先搜尋再回答。
