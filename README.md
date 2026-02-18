@@ -6,6 +6,9 @@
 - bot 端聯網：bot 呼叫 Brave Search API 取得資料，再交給 LM Studio 彙整答案
 - 對話記憶（短期）寫入 `memory/chat_<chat_id>/YYYY-MM-DD.md`（append）
 - 長期偏好記憶（profile）寫入 `memory/chat_<chat_id>/profile.json`，並注入到 LM Studio prompt
+- 群組模式：預設僅在訊息開頭 `@BotUsername` 點名時才回應（私聊不需）
+- 新聞模式：要求每則新聞以 `[n]` 引用多個來源並附出稿日；若模型不遵守，會自動改用逐來源摘要的保底輸出
+- 對話摘要：對話太長時會自動壓縮為摘要寫入 profile，降低 token 負擔並維持上下文
 
 ## 需求
 - Windows / macOS / Linux
@@ -39,6 +42,8 @@ copy .env.example .env
 - `MEMORY_MODE`：`daily` / `per_chat_daily` / `per_chat`
 - `MEMORY_DAYS`：跨天讀取天數（僅 `daily`、`per_chat_daily` 生效）
 - `RECENT_TURNS`：讀取最後 N 則訊息作為上下文
+- `NEWS_FOLLOWUP_DEFAULT_COUNT`：新聞跟進預設數量（預設 `5`）
+- `NEWS_MAX_ITEMS`：新聞最大項目數（預設 `8`）
 
 ### （選用）用 MCP 呼叫 Brave Search
 此專案支援讓 bot 透過 MCP（stdio）啟動並呼叫 `@modelcontextprotocol/server-brave-search`。
@@ -61,6 +66,7 @@ python main.py
 - bot 會讀取（可跨天）最後 N 則訊息作為上下文
 - 另有長期偏好檔：`memory/chat_<chat_id>/profile.json`
   - 目前會記錄：語言偏好、預設天氣地區、是否偏好附來源連結
+  - 另外會維護 `conversation_summary`（自動對話摘要，用於維持上下文且避免 token 過長）
   - 這些偏好會在回覆前注入 system prompt，改善個人化體驗
 
 ## 指令
@@ -72,7 +78,13 @@ python main.py
 目前使用文字紀錄檔保存與讀取最近對話（非向量檢索），因此不需要 embeddings。
 
 ### 2) 群組可以用嗎？
-可以。把 bot 拉進群組並給它讀取訊息權限即可。此程式目前會處理所有非指令文字訊息。
+可以。把 bot 拉進群組並給它讀取訊息權限即可。
+
+群組內預設只在你「點名 bot」時才回覆（避免干擾群聊）：
+- `@BotUsername 今天天氣如何`
+
+私聊則可直接提問：
+- `今天天氣如何`
 
 ### 3) `/memory` 和 `/forget` 會不會刪掉聊天紀錄？
 不會。這兩個指令只操作 `profile.json`（長期偏好），不會刪除 markdown 對話紀錄。

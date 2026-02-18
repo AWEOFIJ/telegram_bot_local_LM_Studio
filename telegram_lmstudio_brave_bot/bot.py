@@ -157,6 +157,103 @@ def _wants_links(user_text: str) -> bool:
     return any(k in t for k in keywords)
 
 
+def _is_followup_continue(user_text: str) -> bool:
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False
+    exact = {
+        "繼續",
+        "继续",
+        "更多",
+        "再來",
+        "再給",
+        "再多",
+        "再多列",
+        "再多幾條",
+        "再多幾則",
+        "再多一點",
+        "再多一些",
+        "more",
+        "continue",
+    }
+    if t in exact:
+        return True
+    # e.g. "再多列 5 條" / "再列3則" / "更多 10"
+    if re.search(r"(再|再多|更多|繼續|继续).{0,6}(\d{1,2})", t):
+        return True
+    return False
+
+
+def _extract_followup_count(user_text: str, default: int = 5, *, max_n: int = 10) -> int:
+    t = (user_text or "")
+    m = re.search(r"(\d{1,2})", t)
+    if not m:
+        return max(1, min(default, max_n))
+    try:
+        n = int(m.group(1))
+    except Exception:
+        n = default
+    return max(1, min(n, max_n))
+
+
+def _strip_leading_bot_mention(user_text: str, bot_username: str) -> tuple[str, bool]:
+    t = (user_text or "").strip()
+    u = (bot_username or "").strip().lstrip("@").lower()
+    if not t or not u:
+        return t, False
+
+    # Accept: "@MyBot ..." or "@MyBot: ..." or "@MyBot，..."
+    m = re.match(r"^@([A-Za-z0-9_]+)\b\s*([:：,，\-—]*)\s*(.*)$", t)
+    if not m:
+        return t, False
+    mentioned = (m.group(1) or "").lower() == u
+    if not mentioned:
+        return t, False
+    rest = (m.group(3) or "").strip()
+    return rest, True
+
+
+async def _summarize_conversation_for_profile(
+    lm: LMStudioClient,
+    *,
+    model: str,
+    existing_summary: str,
+    turns: list[dict],
+) -> str:
+    # Keep it short, stable, and suitable for system prompt injection.
+    content_lines: list[str] = []
+    for m in turns:
+        role = str(m.get("role") or "")
+        txt = str(m.get("content") or "").strip()
+        if not role or not txt:
+            continue
+        txt = re.sub(r"\s+", " ", txt)
+        content_lines.append(f"{role}: {txt}")
+    convo = "\n".join(content_lines)
+
+    prompt = (
+        "你要為 Telegram 對話生成『長期上下文摘要』，用於之後每次回答的 system prompt。\n"
+        "要求：\n"
+        "1) 使用繁體中文\n"
+        "2) 只保留可穩定延續對話的資訊：使用者偏好、目前主題、已確認的背景/定義\n"
+        "3) 不要包含 URL，不要列出逐條新聞，不要複製原文\n"
+        "4) 最多 8 行，每行一句\n"
+    )
+    if existing_summary.strip():
+        prompt += "\n已有摘要（可更新/融合，不要變長）：\n" + existing_summary.strip() + "\n"
+
+    out = await lm.chat_completions(
+        model=model,
+        temperature=0.1,
+        max_tokens=300,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "以下是最近對話片段：\n" + convo},
+        ],
+    )
+    return (out or "").strip()
+
+
 def _infer_profile_updates(user_text: str) -> dict[str, object]:
     t = user_text.strip()
     tl = t.lower()
@@ -201,6 +298,11 @@ def _profile_to_system_prompt(profile: dict[str, object]) -> str:
             lines.append("User preference: include source links when possible.")
         else:
             lines.append("User preference: avoid source links unless explicitly requested.")
+
+    convo_summary = str(profile.get("conversation_summary") or "").strip()
+    if convo_summary:
+        lines.append("Conversation summary (for context, do not repeat verbatim unless asked):")
+        lines.append(convo_summary)
 
     if not lines:
         return ""
@@ -773,6 +875,8 @@ async def run_bot(settings: Settings) -> None:
 
     fetch_top_n = int(getattr(settings, "fetch_top_n", 10) or 10)
     fetch_max_chars = int(getattr(settings, "fetch_max_chars", 8000) or 8000)
+    news_max_items = int(getattr(settings, "news_max_items", 8) or 8)
+    news_followup_default_count = int(getattr(settings, "news_followup_default_count", 5) or 5)
 
     memory = MarkdownMemory(
         memory_dir=settings.memory_dir,
@@ -780,6 +884,7 @@ async def run_bot(settings: Settings) -> None:
         days=settings.memory_days,
     )
     recent: dict[int, deque[dict]] = defaultdict(lambda: deque(maxlen=settings.recent_turns * 2))
+    last_web_context: dict[int, dict[str, object]] = {}
 
     async def on_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat or not update.message:
@@ -806,6 +911,17 @@ async def run_bot(settings: Settings) -> None:
 
         chat_id = update.effective_chat.id
         user_text = update.message.text.strip()
+
+        # Group mode: only respond when explicitly mentioned.
+        chat_type = getattr(update.effective_chat, "type", "")
+        if chat_type in {"group", "supergroup"}:
+            bot_username = getattr(context.bot, "username", "") or ""
+            cleaned, mentioned = _strip_leading_bot_mention(user_text, bot_username)
+            if not mentioned:
+                return
+            user_text = cleaned
+            if not user_text:
+                return
 
         request_id = f"chat{chat_id}_{int(time.time()*1000)}"
         if dbg.enabled:
@@ -845,6 +961,19 @@ async def run_bot(settings: Settings) -> None:
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
 
+        # A) Follow-up continuation: reuse last web_search context for news.
+        is_followup = _is_followup_continue(user_text)
+        prev_ctx = last_web_context.get(chat_id) or {}
+        if is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
+            tool = "web_search"
+            query = ""
+
+        followup_n = _extract_followup_count(
+            user_text,
+            default=news_followup_default_count,
+            max_n=news_max_items,
+        )
+
         force_web_search = _should_force_web_search(user_text)
         weather_override = False
         if _is_weather_question(user_text) or force_web_search:
@@ -861,61 +990,74 @@ async def run_bot(settings: Settings) -> None:
 
         search_results = []
         if tool == "web_search":
-            is_weather = _is_weather_question(user_text)
-            loc = _extract_tw_location(user_text) if is_weather else ""
-            if is_weather and not loc:
-                loc = str(profile.get("default_weather_location") or "").strip()
-            if is_weather and not loc:
-                assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 台中 / 高雄 / 蘇州 / 上海。"
-                if dbg.enabled:
-                    dbg.write_json(
+            if is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
+                search_results = list(prev_ctx.get("search_results") or [])
+            else:
+                is_weather = _is_weather_question(user_text)
+                loc = _extract_tw_location(user_text) if is_weather else ""
+                if is_weather and not loc:
+                    loc = str(profile.get("default_weather_location") or "").strip()
+                if is_weather and not loc:
+                    assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 台中 / 高雄 / 蘇州 / 上海。"
+                    if dbg.enabled:
+                        dbg.write_json(
+                            request_id=request_id,
+                            name="telegram_out",
+                            data={"chat_id": chat_id, "assistant_text": assistant_text},
+                        )
+                    recent[chat_id].append({"role": "assistant", "content": assistant_text})
+                    await memory.add_turn(chat_id=chat_id, role="assistant", content=assistant_text, ts=time.time())
+                    await update.message.reply_text(assistant_text, disable_web_page_preview=True)
+                    return
+
+                if is_weather and loc and not query:
+                    nloc = _normalize_location(loc)
+                    if _is_tw_location(nloc):
+                        query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
+                    else:
+                        query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速"
+
+                if not is_weather and not query and _is_market_index_query(user_text):
+                    if any(k in user_text.lower() for k in ["道瓊", "道琼", "dow jones", "djia"]):
+                        query = "Dow Jones Industrial Average latest close past 5 trading days"
+
+                q = query or user_text
+                if debug:
+                    print(f"[debug] web_search query={q!r}")
+                try:
+                    search_results = await brave.web_search(
+                        query=q,
+                        country=settings.brave_country,
+                        lang=settings.brave_lang,
+                        count=int(getattr(settings, "brave_count", 10) or 10),
                         request_id=request_id,
-                        name="telegram_out",
-                        data={"chat_id": chat_id, "assistant_text": assistant_text},
                     )
-                recent[chat_id].append({"role": "assistant", "content": assistant_text})
-                await memory.add_turn(chat_id=chat_id, role="assistant", content=assistant_text, ts=time.time())
-                await update.message.reply_text(assistant_text, disable_web_page_preview=True)
-                return
+                except Exception:
+                    search_results = []
 
-            if is_weather and loc and not query:
-                nloc = _normalize_location(loc)
-                if _is_tw_location(nloc):
-                    query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
-                else:
-                    query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速"
-
-            if not is_weather and not query and _is_market_index_query(user_text):
-                if any(k in user_text.lower() for k in ["道瓊", "道琼", "dow jones", "djia"]):
-                    query = "Dow Jones Industrial Average latest close past 5 trading days"
-
-            q = query or user_text
-            if debug:
-                print(f"[debug] web_search query={q!r}")
-            try:
-                search_results = await brave.web_search(
-                    query=q,
-                    country=settings.brave_country,
-                    lang=settings.brave_lang,
-                    count=int(getattr(settings, "brave_count", 10) or 10),
+            if dbg.enabled and is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
+                dbg.write_json(
                     request_id=request_id,
+                    name="followup_reused_web_search",
+                    data={"chat_id": chat_id, "reused_results": len(search_results)},
                 )
-            except Exception:
-                search_results = []
 
         search_block = _format_search_results(search_results) if search_results else ""
 
         fetched_pages: list[dict] = []
         if tool == "web_search" and search_results:
-            for item in search_results[:fetch_top_n]:
-                url = (item.get("url") or "").strip()
-                if not url:
-                    continue
-                try:
-                    text = await _fetch_page_text(fetch_client, url=url, max_chars=fetch_max_chars)
-                except Exception:
-                    text = ""
-                fetched_pages.append({"title": item.get("title") or "", "url": url, "text": text})
+            if is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
+                fetched_pages = list(prev_ctx.get("fetched_pages") or [])
+            else:
+                for item in search_results[:fetch_top_n]:
+                    url = (item.get("url") or "").strip()
+                    if not url:
+                        continue
+                    try:
+                        text = await _fetch_page_text(fetch_client, url=url, max_chars=fetch_max_chars)
+                    except Exception:
+                        text = ""
+                    fetched_pages.append({"title": item.get("title") or "", "url": url, "text": text})
 
         if debug and tool == "web_search":
             domains = [_domain((p.get("url") or "").strip()) for p in fetched_pages]
@@ -981,6 +1123,38 @@ async def run_bot(settings: Settings) -> None:
         is_recent_news_q = _is_recent_news_query(user_text)
         source_date_hints, allowed_news_dates = _build_source_date_hints(search_results, fetched_pages)
 
+        # B) Conversation summarization to profile when context is long.
+        try:
+            maxlen = int(settings.recent_turns * 2)
+        except Exception:
+            maxlen = 12
+        if len(recent[chat_id]) >= maxlen:
+            # Summarize older part, keep last few turns verbatim.
+            keep_last = 6
+            turns_list = list(recent[chat_id])
+            older = turns_list[:-keep_last]
+            if older:
+                existing_summary = str(profile.get("conversation_summary") or "")
+                try:
+                    summary = await _summarize_conversation_for_profile(
+                        lm,
+                        model=settings.lmstudio_chat_model,
+                        existing_summary=existing_summary,
+                        turns=older,
+                    )
+                except Exception:
+                    summary = ""
+                if summary.strip():
+                    profile = await memory.upsert_profile(chat_id=chat_id, updates={"conversation_summary": summary.strip()})
+                    if dbg.enabled:
+                        dbg.write_json(
+                            request_id=request_id,
+                            name="conversation_summary_updated",
+                            data={"chat_id": chat_id, "chars": len(summary.strip())},
+                        )
+                    recent[chat_id].clear()
+                    recent[chat_id].extend(turns_list[-keep_last:])
+
         messages = [
             {
                 "role": "system",
@@ -1028,7 +1202,10 @@ async def run_bot(settings: Settings) -> None:
                 )
 
                 if is_news:
-                    n = min(10, len(search_results) if search_results else 10)
+                    if is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
+                        n = min(news_max_items, max(1, followup_n))
+                    else:
+                        n = min(news_max_items, len(search_results) if search_results else news_max_items)
                     date_hint_lines = [f"[{i}] {source_date_hints.get(i, '[未提供日期]')}" for i in range(1, n + 1)]
                     messages.append(
                         {
@@ -1301,7 +1478,7 @@ async def run_bot(settings: Settings) -> None:
                 search_results=search_results,
                 fetched_pages=fetched_pages,
                 source_date_hints=source_date_hints,
-                max_items=min(8, len(search_results)),
+                max_items=min(news_max_items, len(search_results)),
             )
             if fallback_text.strip():
                 assistant_text = fallback_text.strip()
@@ -1311,6 +1488,19 @@ async def run_bot(settings: Settings) -> None:
                     name="news_deterministic_fallback_applied",
                     data={"applied": bool(fallback_text.strip())},
                 )
+
+        # Persist last web_search context for follow-up.
+        if tool == "web_search":
+            last_web_context[chat_id] = {
+                "tool": "web_search",
+                "is_news": bool(is_news),
+                "is_weather": bool(is_weather_q),
+                "query": query or user_text,
+                "search_results": search_results,
+                "fetched_pages": fetched_pages,
+                "source_date_hints": source_date_hints,
+                "ts": time.time(),
+            }
 
         if lang_pref == "zh-Hant" and _looks_simplified_chinese(assistant_text):
             rewrite_messages = [

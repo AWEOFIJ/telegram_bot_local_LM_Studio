@@ -20,6 +20,8 @@ class Settings(BaseModel):
     memory_mode: str = "per_chat_daily"
     memory_days: int = 1
     recent_turns: int = 6
+    news_followup_default_count: int = 5
+    news_max_items: int = 8
 
 
 def load_settings() -> Settings:
@@ -55,4 +57,6 @@ def load_settings() -> Settings:
         memory_mode=os.environ.get("MEMORY_MODE", "daily").strip(),
         memory_days=int(os.environ.get("MEMORY_DAYS", "1")),
         recent_turns=int(os.environ.get("RECENT_TURNS", "6")),
+        news_followup_default_count=int(os.environ.get("NEWS_FOLLOWUP_DEFAULT_COUNT", "5")),
+        news_max_items=int(os.environ.get("NEWS_MAX_ITEMS", "8")),
     )
