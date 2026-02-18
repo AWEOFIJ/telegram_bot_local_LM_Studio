@@ -5,6 +5,7 @@ import ipaddress
 import time
 import logging
 import os
+import re
 from html.parser import HTMLParser
 from collections import defaultdict, deque
 from urllib.parse import urlparse
@@ -101,6 +102,38 @@ def _normalize_location(loc: str) -> str:
     return t
 
 
+_TW_LOCATIONS = {
+    "台北",
+    "臺北",
+    "新北",
+    "基隆",
+    "桃園",
+    "新竹",
+    "苗栗",
+    "台中",
+    "臺中",
+    "彰化",
+    "南投",
+    "雲林",
+    "嘉義",
+    "台南",
+    "臺南",
+    "高雄",
+    "屏東",
+    "宜蘭",
+    "花蓮",
+    "台東",
+    "臺東",
+    "澎湖",
+    "金門",
+    "馬祖",
+}
+
+
+def _is_tw_location(loc: str) -> bool:
+    return _normalize_location(loc).strip() in {_normalize_location(x) for x in _TW_LOCATIONS}
+
+
 def _domain(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").strip().lower()
@@ -122,6 +155,22 @@ def _wants_links(user_text: str) -> bool:
         "source",
     ]
     return any(k in t for k in keywords)
+
+
+def _is_weather_refusal(text: str) -> bool:
+    t = (text or "").lower()
+    patterns = [
+        "無法提供最新",
+        "无法提供最新",
+        "無法提供即時",
+        "无法提供实时",
+        "cannot provide",
+        "can't provide",
+        "unable to provide",
+        "無法查詢",
+        "无法查询",
+    ]
+    return any(p in t for p in patterns)
 
 
 def _is_weather_question(user_text: str) -> bool:
@@ -146,35 +195,26 @@ def _is_weather_question(user_text: str) -> bool:
 
 
 def _extract_tw_location(user_text: str) -> str:
-    locations = [
-        "台北",
-        "臺北",
-        "新北",
-        "基隆",
-        "桃園",
-        "新竹",
-        "苗栗",
-        "台中",
-        "臺中",
-        "彰化",
-        "南投",
-        "雲林",
-        "嘉義",
-        "台南",
-        "臺南",
-        "高雄",
-        "屏東",
-        "宜蘭",
-        "花蓮",
-        "台東",
-        "臺東",
-        "澎湖",
-        "金門",
-        "馬祖",
-    ]
-    for loc in locations:
+    # 1) Known Taiwan cities/counties first.
+    for loc in _TW_LOCATIONS:
         if loc in user_text:
             return loc
+
+    # 2) Generic Chinese location patterns for non-TW cities (e.g., 蘇州、上海).
+    patterns = [
+        r"的([\u4e00-\u9fff]{1,20}?)(?:天氣|天气|氣象|气象|降雨|溫度|温度)",
+        r"(?:今天|今日|目前|現在|最新)?\s*([\u4e00-\u9fff]{2,20}?)(?:天氣|天气|氣象|气象|降雨機率|降雨|溫度|温度)",
+    ]
+    for p in patterns:
+        m = re.search(p, user_text)
+        if not m:
+            continue
+        cand = (m.group(1) or "").strip()
+        cand = re.sub(r"^(我想問|請問|想問|幫我查|查一下|查詢)", "", cand).strip()
+        cand = cand.replace("的", "").strip()
+        if cand and cand not in {"今天", "今日", "目前", "現在", "最新", "天氣", "天气"}:
+            return cand
+
     return ""
 
 
@@ -319,11 +359,16 @@ async def run_bot(settings: Settings) -> None:
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
 
+        weather_override = False
+        if _is_weather_question(user_text):
+            weather_override = True
+            tool = "web_search"
+
         if dbg.enabled:
             dbg.write_json(
                 request_id=request_id,
                 name="plan",
-                data={"tool": tool, "query": query},
+                data={"tool": tool, "query": query, "weather_override": weather_override},
             )
 
         search_results = []
@@ -331,7 +376,7 @@ async def run_bot(settings: Settings) -> None:
             is_weather = _is_weather_question(user_text)
             loc = _extract_tw_location(user_text) if is_weather else ""
             if is_weather and not loc:
-                assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 新北 / 台中 / 高雄。"
+                assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 台中 / 高雄 / 蘇州 / 上海。"
                 if dbg.enabled:
                     dbg.write_json(
                         request_id=request_id,
@@ -345,7 +390,10 @@ async def run_bot(settings: Settings) -> None:
 
             if is_weather and loc and not query:
                 nloc = _normalize_location(loc)
-                query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
+                if _is_tw_location(nloc):
+                    query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
+                else:
+                    query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速"
 
             q = query or user_text
             if debug:
@@ -415,6 +463,7 @@ async def run_bot(settings: Settings) -> None:
                     source_summaries.append(f"[{i}] {title} ({domain})\n{s.strip()}")
 
         summaries_block = "\n\n".join(source_summaries)
+        is_weather_q = _is_weather_question(user_text)
 
         is_news = any(
             k in user_text.lower()
@@ -472,7 +521,7 @@ async def run_bot(settings: Settings) -> None:
                         }
                     )
 
-                if _is_weather_question(user_text):
+                if is_weather_q:
                     messages.append(
                         {
                             "role": "system",
@@ -480,6 +529,9 @@ async def run_bot(settings: Settings) -> None:
                                 "This is a weather / real-time info question. You MUST use the provided web content to answer. "
                                 "Do NOT say you cannot provide real-time info. "
                                 "If the provided sources do not include specific numbers, clearly say 'sources do not contain the detailed forecast numbers' and ask the user for a more specific time/window (e.g., morning/afternoon) or district. "
+                                "Never copy stale values from prior conversation. Ignore previous assistant claims if they conflict with current sources. "
+                                "Do NOT output any explicit date (e.g., '截至2023年...') unless that exact date appears in the provided sources. "
+                                "If a number (temperature/rain chance) is not present in current sources, say it is unavailable rather than guessing. "
                                 "Answer in Traditional Chinese with a compact structure: 概況 / 溫度範圍 / 降雨機率 / 注意事項. "
                                 "Cite sources with [n]. Do NOT include URLs."
                             ),
@@ -516,7 +568,12 @@ async def run_bot(settings: Settings) -> None:
                     }
                 )
 
-        messages.extend(list(recent[chat_id]))
+        history_for_prompt = list(recent[chat_id])
+        if tool == "web_search" and is_weather_q:
+            # Avoid stale weather hallucinations from earlier assistant turns.
+            history_for_prompt = [m for m in history_for_prompt if m.get("role") == "user"][-3:]
+
+        messages.extend(history_for_prompt)
 
         if dbg.enabled:
             dbg.write_json(
@@ -532,6 +589,34 @@ async def run_bot(settings: Settings) -> None:
             max_tokens=900 if (tool == "web_search" and is_news) else None,
             request_id=request_id,
         )
+
+        if tool == "web_search" and is_weather_q and search_results and _is_weather_refusal(assistant_text):
+            retry_messages = list(messages)
+            retry_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous answer is invalid because it refused real-time weather. "
+                        "You must answer using current provided sources and citations [n]. "
+                        "Do NOT refuse. Do NOT say you cannot provide real-time info. "
+                        "If exact numbers are unavailable, explicitly state 'sources do not contain the detailed forecast numbers'. "
+                        "Use Traditional Chinese with sections: 概況 / 溫度範圍 / 降雨機率 / 注意事項."
+                    ),
+                }
+            )
+            retry_messages.append(
+                {
+                    "role": "user",
+                    "content": user_text,
+                }
+            )
+            assistant_text = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=retry_messages,
+                temperature=0.1,
+                max_tokens=450,
+                request_id=request_id,
+            )
 
         if tool == "web_search" and is_news and search_results:
             urls = [(item.get("url") or "").strip() for item in search_results]

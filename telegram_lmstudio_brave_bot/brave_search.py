@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import traceback
 from typing import Any
 
 import httpx
@@ -59,6 +61,92 @@ class BraveSearchClient:
             )
         return out
 
+    def _extract_mcp_body(self, res: dict[str, Any]) -> Any:
+        # Common MCP tool shape: result.structuredContent carries machine-readable data.
+        structured = res.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+
+        # Some servers return direct web/search body at top-level result.
+        if isinstance(res.get("web"), dict):
+            return res
+
+        content = res.get("content")
+        if isinstance(content, list) and content:
+            # Prefer JSON payload blocks.
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("json"), dict):
+                    return item.get("json")
+
+            # Fallback: attempt to parse text blocks as JSON.
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    text = item["text"].strip()
+                    if not text:
+                        continue
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        continue
+
+        return None
+
+    def _parse_mcp_text_results(self, res: dict[str, Any], *, count: int) -> list[dict[str, Any]]:
+        content = res.get("content")
+        if not isinstance(content, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "text" or not isinstance(item.get("text"), str):
+                continue
+
+            text = item.get("text", "")
+            current: dict[str, str] = {"title": "", "url": "", "description": ""}
+
+            def _flush_current() -> None:
+                if (current.get("title") or "").strip() and (current.get("url") or "").strip():
+                    out.append(
+                        {
+                            "title": current.get("title", "").strip(),
+                            "url": current.get("url", "").strip(),
+                            "description": current.get("description", "").strip(),
+                        }
+                    )
+
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                if line.startswith("Title:"):
+                    _flush_current()
+                    current = {"title": line[len("Title:") :].strip(), "url": "", "description": ""}
+                    continue
+
+                if line.startswith("Description:"):
+                    current["description"] = line[len("Description:") :].strip()
+                    continue
+
+                if line.startswith("URL:"):
+                    current["url"] = line[len("URL:") :].strip()
+                    continue
+
+                # Continuation lines are appended to description.
+                if current.get("description"):
+                    current["description"] = (current.get("description", "") + " " + line).strip()
+
+            _flush_current()
+
+            if len(out) >= count:
+                break
+
+        return out[:count]
+
     async def web_search(
         self,
         *,
@@ -96,20 +184,13 @@ class BraveSearchClient:
                         data=res,
                     )
 
-                content = res.get("content")
-                body: Any = None
-                if isinstance(content, list) and content:
-                    first = content[0]
-                    if isinstance(first, dict):
-                        if "json" in first:
-                            body = first.get("json")
-                        elif first.get("type") == "text" and isinstance(first.get("text"), str):
-                            try:
-                                body = httpx.Response(200, text=first["text"]).json()
-                            except Exception:
-                                body = None
+                body: Any = self._extract_mcp_body(res)
 
                 results = self._parse_mcp_web_results(body, count=count)
+                if not results:
+                    results = self._parse_mcp_text_results(res, count=count)
+                if not results:
+                    raise RuntimeError("MCP returned no parseable web results")
                 if self._debug and self._debug.enabled and request_id:
                     self._debug.write_json(
                         request_id=request_id,
@@ -117,8 +198,18 @@ class BraveSearchClient:
                         data={"count": len(results), "results": results},
                     )
                 return results
-            except Exception:
-                pass
+            except Exception as e:
+                if self._debug and self._debug.enabled and request_id:
+                    self._debug.write_json(
+                        request_id=request_id,
+                        name="brave_mcp_error",
+                        data={
+                            "error": repr(e),
+                            "traceback": traceback.format_exc(),
+                            "command": self._mcp_config.command,
+                            "args": self._mcp_config.args,
+                        },
+                    )
 
         url = "https://api.search.brave.com/res/v1/web/search"
         headers = {

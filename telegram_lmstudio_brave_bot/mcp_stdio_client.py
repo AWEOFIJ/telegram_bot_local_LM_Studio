@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +21,7 @@ class MCPStdioClient:
         self._timeout_s = timeout_s
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
         self._lock = asyncio.Lock()
@@ -27,16 +30,50 @@ class MCPStdioClient:
         if self._proc is not None:
             return
 
-        self._proc = await asyncio.create_subprocess_exec(
-            self._config.command,
-            *self._config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._config.env,
-        )
+        child_env = dict(os.environ)
+        if self._config.env:
+            child_env.update(self._config.env)
+
+        command = self._config.command
+        resolved = shutil.which(command)
+        if resolved:
+            command = resolved
+        elif os.name == "nt":
+            if not command.lower().endswith((".exe", ".cmd", ".bat")):
+                cmd2 = command + ".cmd"
+                resolved2 = shutil.which(cmd2)
+                if resolved2:
+                    command = resolved2
+                else:
+                    command = cmd2
+
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                command,
+                *self._config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_env,
+            )
+        except FileNotFoundError:
+            if os.name != "nt":
+                raise
+            joined = " ".join([self._config.command, *self._config.args])
+            self._proc = await asyncio.create_subprocess_exec(
+                "cmd.exe",
+                "/c",
+                joined,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_env,
+            )
         assert self._proc.stdout is not None
         self._reader_task = asyncio.create_task(self._reader_loop(self._proc.stdout))
+
+        if self._proc.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc.stderr))
 
         await self._initialize()
 
@@ -66,6 +103,9 @@ class MCPStdioClient:
 
         if self._reader_task is not None:
             self._reader_task.cancel()
+
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
 
         self._proc = None
 
@@ -140,3 +180,9 @@ class MCPStdioClient:
                 fut = self._pending.get(msg_id)
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
+
+    async def _drain_stderr(self, stderr: asyncio.StreamReader) -> None:
+        while True:
+            line_b = await stderr.readline()
+            if not line_b:
+                return
