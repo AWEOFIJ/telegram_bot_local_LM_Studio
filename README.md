@@ -31,10 +31,20 @@ copy .env.example .env
 - `BRAVE_API_KEY`：你的 Brave API key
 - `BRAVE_COUNTRY`：搜尋地區（預設 `TW`）
 - `BRAVE_LANG`：搜尋語系（預設 `zh-hant`）
+- `BRAVE_COUNT`：每次 web search 取回的結果數（預設 `10`）
+- `FETCH_TOP_N`：從搜尋結果中最多抓取幾個網頁做全文擷取（預設 `10`）
+- `FETCH_MAX_CHARS`：每個網頁最多擷取的純文字字數上限（預設 `8000`）
 - `MEMORY_DIR`：記憶檔資料夾（預設 `memory`）
 - `MEMORY_MODE`：`daily` / `per_chat_daily` / `per_chat`
 - `MEMORY_DAYS`：跨天讀取天數（僅 `daily`、`per_chat_daily` 生效）
 - `RECENT_TURNS`：讀取最後 N 則訊息作為上下文
+
+### （選用）用 MCP 呼叫 Brave Search
+此專案支援讓 bot 透過 MCP（stdio）啟動並呼叫 `@modelcontextprotocol/server-brave-search`。
+如需啟用，請在 `.env` 設定：
+- `MCP_BRAVE_ENABLED=1`
+- `MCP_BRAVE_COMMAND=npx`
+- `MCP_BRAVE_ARGS=-y @modelcontextprotocol/server-brave-search`
 
 ## 執行
 ```powershell
@@ -44,10 +54,10 @@ python main.py
 ## 記憶資料
 - 會把對話以 append 方式寫入 markdown 檔（可由 `.env` 控制）
   - 每行格式：`- [HH:MM:SS] chat:<chat_id> (user|assistant) <content>`
- - `MEMORY_MODE=daily`：寫到 `memory/YYYY-MM-DD.md`
- - `MEMORY_MODE=per_chat_daily`：寫到 `memory/chat_<chat_id>/YYYY-MM-DD.md`
- - `MEMORY_MODE=per_chat`：寫到 `memory/chat_<chat_id>.md`
- - bot 會讀取（可跨天）最後 N 則訊息作為上下文
+- `MEMORY_MODE=per_chat_daily`：寫到 `memory/chat_<chat_id>/YYYY-MM-DD.md`（推薦，依 chat 分資料夾）
+- `MEMORY_MODE=daily`：此專案同樣會寫到 `memory/chat_<chat_id>/YYYY-MM-DD.md`（避免不同 chat 混在同一檔）
+- `MEMORY_MODE=per_chat`：寫到 `memory/chat_<chat_id>.md`
+- bot 會讀取（可跨天）最後 N 則訊息作為上下文
 
 ## 常見問題
 ### 1) 為什麼不需要 `LMSTUDIO_EMBED_MODEL`？

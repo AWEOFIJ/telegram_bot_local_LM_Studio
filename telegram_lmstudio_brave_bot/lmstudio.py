@@ -5,11 +5,20 @@ from typing import Any
 
 import httpx
 
+from .debug_logger import DebugLogger
+
 
 class LMStudioClient:
-    def __init__(self, base_url: str, timeout_s: float = 60.0):
+    def __init__(
+        self,
+        base_url: str,
+        timeout_s: float = 60.0,
+        *,
+        debug_logger: DebugLogger | None = None,
+    ):
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(timeout=timeout_s)
+        self._debug = debug_logger
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -22,6 +31,7 @@ class LMStudioClient:
         temperature: float = 0.2,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -33,19 +43,67 @@ class LMStudioClient:
         if response_format is not None:
             payload["response_format"] = response_format
 
+        url = f"{self._base_url}/chat/completions"
+        if self._debug and self._debug.enabled and request_id:
+            self._debug.write_json(
+                request_id=request_id,
+                name="lmstudio_chat_request",
+                data={"url": url, "payload": payload},
+            )
+
         resp = await self._client.post(
-            f"{self._base_url}/chat/completions",
+            url,
             json=payload,
         )
+
+        if self._debug and self._debug.enabled and request_id:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"_non_json_text": resp.text}
+            self._debug.write_json(
+                request_id=request_id,
+                name="lmstudio_chat_response",
+                data={"status_code": resp.status_code, "headers": dict(resp.headers), "body": body},
+            )
+
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    async def embeddings(self, *, model: str, input_texts: list[str]) -> list[list[float]]:
+    async def embeddings(
+        self,
+        *,
+        model: str,
+        input_texts: list[str],
+        request_id: str | None = None,
+    ) -> list[list[float]]:
+        url = f"{self._base_url}/embeddings"
+        payload = {"model": model, "input": input_texts}
+
+        if self._debug and self._debug.enabled and request_id:
+            self._debug.write_json(
+                request_id=request_id,
+                name="lmstudio_embeddings_request",
+                data={"url": url, "payload": payload},
+            )
+
         resp = await self._client.post(
-            f"{self._base_url}/embeddings",
-            json={"model": model, "input": input_texts},
+            url,
+            json=payload,
         )
+
+        if self._debug and self._debug.enabled and request_id:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"_non_json_text": resp.text}
+            self._debug.write_json(
+                request_id=request_id,
+                name="lmstudio_embeddings_response",
+                data={"status_code": resp.status_code, "headers": dict(resp.headers), "body": body},
+            )
+
         resp.raise_for_status()
         data = resp.json()
         return [item["embedding"] for item in data["data"]]

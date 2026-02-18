@@ -22,7 +22,7 @@ class MarkdownMemory:
         d = day.isoformat()
 
         if self._mode == "daily":
-            return os.path.join(self._dir, f"{d}.md")
+            return os.path.join(self._dir, f"chat_{chat_id}", f"{d}.md")
         if self._mode == "per_chat_daily":
             return os.path.join(self._dir, f"chat_{chat_id}", f"{d}.md")
         if self._mode == "per_chat":

@@ -17,6 +17,7 @@ from .brave_search import BraveSearchClient
 from .config import Settings
 from .lmstudio import LMStudioClient, llm_plan_tools
 from .memory import MarkdownMemory
+from .debug_logger import debug_logger_from_env
 
 
 class _TextExtractor(HTMLParser):
@@ -119,6 +120,27 @@ def _wants_links(user_text: str) -> bool:
         "來源",
         "来源",
         "source",
+    ]
+    return any(k in t for k in keywords)
+
+
+def _is_weather_question(user_text: str) -> bool:
+    t = user_text.lower()
+    keywords = [
+        "天氣",
+        "天气",
+        "氣象",
+        "氣温",
+        "气温",
+        "溫度",
+        "温度",
+        "降雨",
+        "下雨",
+        "雷雨",
+        "颱風",
+        "台风",
+        "降雨機率",
+        "降雨概率",
     ]
     return any(k in t for k in keywords)
 
@@ -241,16 +263,24 @@ def _format_fetched_pages(pages: list[dict]) -> str:
 
 
 async def run_bot(settings: Settings) -> None:
-    lm = LMStudioClient(settings.lmstudio_base_url)
-    brave = BraveSearchClient(settings.brave_api_key)
+    dbg = debug_logger_from_env()
+
+    lm = LMStudioClient(settings.lmstudio_base_url, debug_logger=dbg)
+    brave = BraveSearchClient(
+        settings.brave_api_key,
+        debug_logger=dbg,
+        mcp_enabled=getattr(settings, "mcp_brave_enabled", False),
+        mcp_command=getattr(settings, "mcp_brave_command", "npx"),
+        mcp_args=getattr(settings, "mcp_brave_args", None),
+    )
     fetch_client = httpx.AsyncClient(timeout=12.0)
 
     import os
 
     debug = os.environ.get("DEBUG", "").strip() in {"1", "true", "True", "yes", "YES"}
 
-    fetch_top_n = 5
-    fetch_max_chars = 4500
+    fetch_top_n = int(getattr(settings, "fetch_top_n", 10) or 10)
+    fetch_max_chars = int(getattr(settings, "fetch_max_chars", 8000) or 8000)
 
     memory = MarkdownMemory(
         memory_dir=settings.memory_dir,
@@ -266,11 +296,17 @@ async def run_bot(settings: Settings) -> None:
         chat_id = update.effective_chat.id
         user_text = update.message.text.strip()
 
-        if _should_force_web_search(user_text):
-            loc = _extract_tw_location(user_text)
-            if not loc:
-                await update.message.reply_text("你想查哪個城市/地區的天氣？例如：台北 / 新北 / 台中 / 高雄。", disable_web_page_preview=True)
-                return
+        request_id = f"chat{chat_id}_{int(time.time()*1000)}"
+        if dbg.enabled:
+            dbg.write_json(
+                request_id=request_id,
+                name="telegram_in",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": update.message.message_id,
+                    "user_text": user_text,
+                },
+            )
 
         recent[chat_id].append({"role": "user", "content": user_text})
         await memory.add_turn(chat_id=chat_id, role="user", content=user_text, ts=time.time())
@@ -279,22 +315,38 @@ async def run_bot(settings: Settings) -> None:
         recent[chat_id].clear()
         recent[chat_id].extend(persisted)
 
-        if _should_force_web_search(user_text):
-            loc = _extract_tw_location(user_text)
-            nloc = _normalize_location(loc)
-            q = (
-                f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
-                if nloc
-                else user_text
-            )
-            plan = {"tool": "web_search", "query": q}
-        else:
-            plan = await llm_plan_tools(lm, model=settings.lmstudio_chat_model, user_text=user_text)
+        plan = await llm_plan_tools(lm, model=settings.lmstudio_chat_model, user_text=user_text)
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
 
+        if dbg.enabled:
+            dbg.write_json(
+                request_id=request_id,
+                name="plan",
+                data={"tool": tool, "query": query},
+            )
+
         search_results = []
         if tool == "web_search":
+            is_weather = _is_weather_question(user_text)
+            loc = _extract_tw_location(user_text) if is_weather else ""
+            if is_weather and not loc:
+                assistant_text = "你想查哪個城市/地區的天氣？例如：台北 / 新北 / 台中 / 高雄。"
+                if dbg.enabled:
+                    dbg.write_json(
+                        request_id=request_id,
+                        name="telegram_out",
+                        data={"chat_id": chat_id, "assistant_text": assistant_text},
+                    )
+                recent[chat_id].append({"role": "assistant", "content": assistant_text})
+                await memory.add_turn(chat_id=chat_id, role="assistant", content=assistant_text, ts=time.time())
+                await update.message.reply_text(assistant_text, disable_web_page_preview=True)
+                return
+
+            if is_weather and loc and not query:
+                nloc = _normalize_location(loc)
+                query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
+
             q = query or user_text
             if debug:
                 print(f"[debug] web_search query={q!r}")
@@ -303,7 +355,8 @@ async def run_bot(settings: Settings) -> None:
                     query=q,
                     country=settings.brave_country,
                     lang=settings.brave_lang,
-                    count=5,
+                    count=int(getattr(settings, "brave_count", 10) or 10),
+                    request_id=request_id,
                 )
             except Exception:
                 search_results = []
@@ -327,7 +380,7 @@ async def run_bot(settings: Settings) -> None:
             sizes = [len((p.get("text") or "").strip()) for p in fetched_pages]
             print(f"[debug] results={len(search_results)} fetched={len(fetched_pages)} domains={domains} sizes={sizes}")
 
-        if tool == "web_search" and _should_force_web_search(user_text):
+        if tool == "web_search" and _is_weather_question(user_text):
             if not any((p.get("text") or "").strip() for p in fetched_pages):
                 await update.message.reply_text(
                     "我目前抓不到可用的即時天氣內容（可能被網站阻擋或來源不穩）。請再提供城市/地區，或改問：『台北今天降雨機率』。",
@@ -363,6 +416,26 @@ async def run_bot(settings: Settings) -> None:
 
         summaries_block = "\n\n".join(source_summaries)
 
+        is_news = any(
+            k in user_text.lower()
+            for k in [
+                "新聞",
+                "新闻",
+                "news",
+                "headline",
+                "頭條",
+                "头条",
+                "兩岸",
+                "两岸",
+                "國際",
+                "国际",
+                "財經",
+                "财经",
+                "金融",
+                "finance",
+            ]
+        )
+
         messages = [
             {
                 "role": "system",
@@ -384,7 +457,22 @@ async def run_bot(settings: Settings) -> None:
                     }
                 )
 
-                if _should_force_web_search(user_text):
+                if is_news:
+                    n = min(10, len(search_results) if search_results else 10)
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The user is asking for news. "
+                                f"You MUST list at least {n} distinct news items if sources are available. "
+                                "Return a bullet list. Each bullet must contain: a short headline, a 1-2 sentence summary, and a citation like [n]. "
+                                "Each bullet MUST cite a different source index when possible. "
+                                "Do NOT write generic summaries. Do NOT merge multiple news into one bullet."
+                            ),
+                        }
+                    )
+
+                if _is_weather_question(user_text):
                     messages.append(
                         {
                             "role": "system",
@@ -430,11 +518,28 @@ async def run_bot(settings: Settings) -> None:
 
         messages.extend(list(recent[chat_id]))
 
+        if dbg.enabled:
+            dbg.write_json(
+                request_id=request_id,
+                name="final_messages",
+                data={"messages": messages},
+            )
+
         assistant_text = await lm.chat_completions(
             model=settings.lmstudio_chat_model,
             messages=messages,
             temperature=0.3,
+            max_tokens=900 if (tool == "web_search" and is_news) else None,
+            request_id=request_id,
         )
+
+        if tool == "web_search" and is_news and search_results:
+            urls = [(item.get("url") or "").strip() for item in search_results]
+            urls = [u for u in urls if u]
+            if urls:
+                n = min(10, len(urls))
+                link_lines = [f"[{i}] {urls[i - 1]}" for i in range(1, n + 1)]
+                assistant_text = assistant_text.rstrip() + "\n\n" + "來源連結：\n" + "\n".join(link_lines)
 
         if tool == "web_search" and _wants_links(user_text) and search_results:
             urls = [
@@ -447,6 +552,13 @@ async def run_bot(settings: Settings) -> None:
 
         recent[chat_id].append({"role": "assistant", "content": assistant_text})
         await memory.add_turn(chat_id=chat_id, role="assistant", content=assistant_text, ts=time.time())
+
+        if dbg.enabled:
+            dbg.write_json(
+                request_id=request_id,
+                name="telegram_out",
+                data={"chat_id": chat_id, "assistant_text": assistant_text},
+            )
 
         await update.message.reply_text(assistant_text, disable_web_page_preview=True)
 

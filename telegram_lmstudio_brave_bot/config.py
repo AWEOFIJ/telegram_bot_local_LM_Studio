@@ -10,8 +10,14 @@ class Settings(BaseModel):
     brave_api_key: str
     brave_country: str = "TW"
     brave_lang: str = "zh-hant"
+    brave_count: int = 10
+    mcp_brave_enabled: bool = False
+    mcp_brave_command: str = "npx"
+    mcp_brave_args: list[str] = ["-y", "@modelcontextprotocol/server-brave-search"]
+    fetch_top_n: int = 10
+    fetch_max_chars: int = 8000
     memory_dir: str = "memory"
-    memory_mode: str = "daily"
+    memory_mode: str = "per_chat_daily"
     memory_days: int = 1
     recent_turns: int = 6
 
@@ -21,7 +27,12 @@ def load_settings() -> Settings:
 
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     brave_api_key = os.environ.get("BRAVE_API_KEY", "").strip()
- 
+
+    mcp_brave_enabled = os.environ.get("MCP_BRAVE_ENABLED", "").strip() in {"1", "true", "True", "yes", "YES"}
+    mcp_brave_command = os.environ.get("MCP_BRAVE_COMMAND", "npx").strip() or "npx"
+    mcp_brave_args_raw = os.environ.get("MCP_BRAVE_ARGS", "-y @modelcontextprotocol/server-brave-search").strip()
+    mcp_brave_args = [a for a in mcp_brave_args_raw.split() if a.strip()]
+
     if not telegram_bot_token:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not brave_api_key:
@@ -34,6 +45,12 @@ def load_settings() -> Settings:
         brave_api_key=brave_api_key,
         brave_country=os.environ.get("BRAVE_COUNTRY", "TW").strip(),
         brave_lang=os.environ.get("BRAVE_LANG", "zh-hant").strip(),
+        brave_count=int(os.environ.get("BRAVE_COUNT", "10")),
+        mcp_brave_enabled=mcp_brave_enabled,
+        mcp_brave_command=mcp_brave_command,
+        mcp_brave_args=mcp_brave_args,
+        fetch_top_n=int(os.environ.get("FETCH_TOP_N", "10")),
+        fetch_max_chars=int(os.environ.get("FETCH_MAX_CHARS", "8000")),
         memory_dir=os.environ.get("MEMORY_DIR", "memory").strip(),
         memory_mode=os.environ.get("MEMORY_MODE", "daily").strip(),
         memory_days=int(os.environ.get("MEMORY_DAYS", "1")),
