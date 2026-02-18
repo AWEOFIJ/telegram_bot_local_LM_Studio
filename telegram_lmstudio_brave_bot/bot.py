@@ -185,11 +185,11 @@ def _profile_to_system_prompt(profile: dict[str, object]) -> str:
 
     lang = str(profile.get("preferred_language") or "").strip()
     if lang == "zh-Hant":
-        lines.append("User preference: reply in Traditional Chinese unless user explicitly asks otherwise.")
+        lines.append("User preference: MUST reply in Traditional Chinese unless user explicitly asks otherwise.")
     elif lang == "zh-Hans":
-        lines.append("User preference: reply in Simplified Chinese unless user explicitly asks otherwise.")
+        lines.append("User preference: MUST reply in Simplified Chinese unless user explicitly asks otherwise.")
     elif lang == "en":
-        lines.append("User preference: reply in English unless user explicitly asks otherwise.")
+        lines.append("User preference: MUST reply in English unless user explicitly asks otherwise.")
 
     default_loc = str(profile.get("default_weather_location") or "").strip()
     if default_loc:
@@ -232,6 +232,139 @@ def _format_profile_text(profile: dict[str, object]) -> str:
     if not lines:
         return "目前沒有已儲存的長期記憶偏好。"
     return "目前的長期記憶偏好：\n" + "\n".join(lines)
+
+
+_SIMPLIFIED_ONLY_MARKERS = {
+    "这",
+    "个",
+    "为",
+    "对",
+    "后",
+    "们",
+    "来",
+    "时",
+    "于",
+    "国",
+    "军",
+    "关",
+    "里",
+    "实",
+    "预",
+    "报",
+    "无",
+    "并",
+}
+
+
+def _looks_simplified_chinese(text: str) -> bool:
+    if not text:
+        return False
+    hit = sum(text.count(ch) for ch in _SIMPLIFIED_ONLY_MARKERS)
+    return hit >= 2
+
+
+def _is_recent_news_query(user_text: str) -> bool:
+    t = user_text.lower()
+    recent_markers = ["最近", "近日", "最新", "近幾日", "近几日", "這幾天", "这几天", "24小時", "24小时"]
+    news_markers = [
+        "新聞",
+        "新闻",
+        "news",
+        "軍演",
+        "军演",
+        "海域",
+        "時事",
+        "时事",
+        "快訊",
+        "快讯",
+        "財經",
+        "财经",
+        "金融",
+        "股市",
+        "指數",
+        "指数",
+        "道瓊",
+        "道琼",
+        "dow jones",
+        "nasdaq",
+        "s&p",
+        "sp500",
+    ]
+    return any(k in t for k in recent_markers) and any(k in t for k in news_markers)
+
+
+def _is_market_index_query(user_text: str) -> bool:
+    t = user_text.lower()
+    keywords = [
+        "道瓊",
+        "道琼",
+        "dow jones",
+        "djia",
+        "納斯達克",
+        "纳斯达克",
+        "nasdaq",
+        "s&p",
+        "sp500",
+        "指數",
+        "指数",
+        "股市",
+        "美股",
+    ]
+    return any(k in t for k in keywords)
+
+
+def _extract_years(text: str) -> list[int]:
+    years = {int(y) for y in re.findall(r"(20\d{2})年?", text or "")}
+    return sorted(years)
+
+
+def _contains_stale_year_for_recent(text: str) -> bool:
+    current_year = int(time.localtime().tm_year)
+    return any(y <= (current_year - 1) for y in _extract_years(text))
+
+
+def _has_source_links_block(text: str) -> bool:
+    t = (text or "").lower()
+    if any(k in t for k in ["來源連結", "来源链接", "來源鏈接", "source links", "references"]):
+        return True
+    return bool(re.search(r"\n\[[0-9]+\]\s+https?://", text or "", flags=re.IGNORECASE))
+
+
+def _build_recent_news_fallback(*, user_text: str, search_results: list[dict[str, object]]) -> str:
+    lines = [
+        "我已查詢最新來源，但目前前幾個來源多為背景頁或歷史內容，無法可靠支持「最近幾天」的具體財經數字。",
+        "若你要，我可以改成：",
+        "1) 只整理『今天/過去 24 小時』可驗證的快訊",
+        "2) 鎖定特定市場（美股/台股/中國股市/原油）再即時整理",
+        "",
+        "目前可用來源（先供你點閱）：",
+    ]
+
+    for i, item in enumerate(search_results[:5], start=1):
+        title = str(item.get("title") or "").strip() or "(untitled)"
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        lines.append(f"[{i}] {title}")
+        lines.append(url)
+
+    return "\n".join(lines).strip()
+
+
+def _news_output_has_date_prefix(text: str) -> bool:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip().startswith(("-", "•", "*"))]
+    if not lines:
+        return False
+
+    date_re = re.compile(r"20\d{2}\s*[-/年]\s*\d{1,2}(?:\s*[-/月]\s*\d{1,2}\s*日?)?")
+    for ln in lines:
+        head = ln[:64]
+        if date_re.search(head):
+            continue
+        if "未提供日期" in head:
+            continue
+        return False
+    return True
 
 
 def _is_weather_refusal(text: str) -> bool:
@@ -300,6 +433,16 @@ def _should_force_web_search(user_text: str) -> bool:
     keywords = [
         "天氣",
         "天气",
+        "新聞",
+        "新闻",
+        "news",
+        "軍演",
+        "军演",
+        "海域",
+        "時事",
+        "时事",
+        "最近",
+        "近日",
         "氣象",
         "温度",
         "溫度",
@@ -340,6 +483,8 @@ async def _summarize_source(
                     "Return concise Traditional Chinese bullet points that are directly relevant to the user's question. "
                     "Do NOT include URLs. Do NOT mention you cannot browse. "
                     "If the source does not contain relevant information, say so briefly. "
+                    "For each bullet, include the source publication date at the beginning when available (YYYY-MM-DD). "
+                    "If no date is found in the source, begin with '[未提供日期]'. "
                     "End each bullet with the citation marker like [n] where n is the source index."
                 ),
             },
@@ -470,9 +615,11 @@ async def run_bot(settings: Settings) -> None:
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
 
+        force_web_search = _should_force_web_search(user_text)
         weather_override = False
-        if _is_weather_question(user_text):
-            weather_override = True
+        if _is_weather_question(user_text) or force_web_search:
+            if _is_weather_question(user_text):
+                weather_override = True
             tool = "web_search"
 
         if dbg.enabled:
@@ -507,6 +654,10 @@ async def run_bot(settings: Settings) -> None:
                     query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
                 else:
                     query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速"
+
+            if not is_weather and not query and _is_market_index_query(user_text):
+                if any(k in user_text.lower() for k in ["道瓊", "道琼", "dow jones", "djia"]):
+                    query = "Dow Jones Industrial Average latest close past 5 trading days"
 
             q = query or user_text
             if debug:
@@ -597,6 +748,7 @@ async def run_bot(settings: Settings) -> None:
                 "finance",
             ]
         )
+        is_recent_news_q = _is_recent_news_query(user_text)
 
         messages = [
             {
@@ -607,6 +759,28 @@ async def run_bot(settings: Settings) -> None:
         profile_prompt = _profile_to_system_prompt(profile)
         if profile_prompt:
             messages.append({"role": "system", "content": profile_prompt})
+        lang = str(profile.get("preferred_language") or "").strip()
+        if lang == "zh-Hant":
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Output language rule: reply in Traditional Chinese only unless user explicitly requests another language.",
+                }
+            )
+        elif lang == "zh-Hans":
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Output language rule: reply in Simplified Chinese only unless user explicitly requests another language.",
+                }
+            )
+        elif lang == "en":
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Output language rule: reply in English only unless user explicitly requests another language.",
+                }
+            )
 
         if tool == "web_search":
             if search_block:
@@ -630,7 +804,8 @@ async def run_bot(settings: Settings) -> None:
                             "content": (
                                 "The user is asking for news. "
                                 f"You MUST list at least {n} distinct news items if sources are available. "
-                                "Return a bullet list. Each bullet must contain: a short headline, a 1-2 sentence summary, and a citation like [n]. "
+                                "Return a bullet list. Each bullet must contain: publication date (YYYY-MM-DD, or [未提供日期] if not available), a short headline, a 1-2 sentence summary, and a citation like [n]. "
+                                "The publication date must be placed at the beginning of each bullet. "
                                 "Each bullet MUST cite a different source index when possible. "
                                 "Do NOT write generic summaries. Do NOT merge multiple news into one bullet."
                             ),
@@ -685,8 +860,8 @@ async def run_bot(settings: Settings) -> None:
                 )
 
         history_for_prompt = list(recent[chat_id])
-        if tool == "web_search" and is_weather_q:
-            # Avoid stale weather hallucinations from earlier assistant turns.
+        if tool == "web_search" and (is_weather_q or is_recent_news_q):
+            # Avoid stale contamination from earlier assistant turns in recency-sensitive queries.
             history_for_prompt = [m for m in history_for_prompt if m.get("role") == "user"][-3:]
 
         messages.extend(history_for_prompt)
@@ -734,10 +909,133 @@ async def run_bot(settings: Settings) -> None:
                 request_id=request_id,
             )
 
+        lang_pref = str(profile.get("preferred_language") or "").strip()
+        if lang_pref == "zh-Hant" and _looks_simplified_chinese(assistant_text):
+            rewrite_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the text into Traditional Chinese (繁體中文) only. "
+                        "Keep meaning, structure, citations like [n], and URLs unchanged. "
+                        "Do not add or remove facts."
+                    ),
+                },
+                {"role": "user", "content": assistant_text},
+            ]
+            rewritten = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=rewrite_messages,
+                temperature=0.0,
+                max_tokens=1200,
+                request_id=request_id,
+            )
+            if (rewritten or "").strip():
+                assistant_text = rewritten.strip()
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="language_rewrite_applied",
+                    data={"preferred_language": lang_pref},
+                )
+
+        if tool == "web_search" and is_recent_news_q and search_results and _contains_stale_year_for_recent(assistant_text):
+            stale_years = _extract_years(assistant_text)
+            retry_messages = list(messages)
+            retry_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous answer is invalid for a recent-news query because it used stale timeline years. "
+                        "Re-answer using only very recent updates from provided sources. "
+                        "If provided sources do not clearly support events in the last few days, explicitly say so and ask user whether to broaden the time range. "
+                        "Do NOT fabricate dates. Keep citations [n]."
+                    ),
+                }
+            )
+            retry_messages.append({"role": "user", "content": user_text})
+            assistant_text = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=retry_messages,
+                temperature=0.1,
+                max_tokens=700,
+                request_id=request_id,
+            )
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="recent_news_stale_retry",
+                    data={"stale_years": stale_years},
+                )
+
+        if tool == "web_search" and is_recent_news_q and search_results and _contains_stale_year_for_recent(assistant_text):
+            assistant_text = _build_recent_news_fallback(user_text=user_text, search_results=search_results)
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="recent_news_fallback_used",
+                    data={"reason": "stale_year_after_retry", "years": _extract_years(assistant_text)},
+                )
+
+        if tool == "web_search" and is_news and search_results and not _news_output_has_date_prefix(assistant_text):
+            retry_messages = list(messages)
+            retry_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous news output is invalid because each bullet must start with publication date. "
+                        "Rewrite as bullet list and put date at beginning of each bullet in YYYY-MM-DD. "
+                        "If source date is unavailable, start the bullet with [未提供日期]. "
+                        "Keep citations [n] and do not fabricate unsupported facts."
+                    ),
+                }
+            )
+            retry_messages.append({"role": "user", "content": user_text})
+            assistant_text = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=retry_messages,
+                temperature=0.1,
+                max_tokens=900,
+                request_id=request_id,
+            )
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="news_date_retry",
+                    data={"enforced": True},
+                )
+
+        if lang_pref == "zh-Hant" and _looks_simplified_chinese(assistant_text):
+            rewrite_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the text into Traditional Chinese (繁體中文) only. "
+                        "Keep meaning, structure, citations like [n], and URLs unchanged. "
+                        "Do not add or remove facts."
+                    ),
+                },
+                {"role": "user", "content": assistant_text},
+            ]
+            rewritten = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=rewrite_messages,
+                temperature=0.0,
+                max_tokens=1200,
+                request_id=request_id,
+            )
+            if (rewritten or "").strip():
+                assistant_text = rewritten.strip()
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=request_id,
+                    name="language_rewrite_applied",
+                    data={"preferred_language": lang_pref, "stage": "final"},
+                )
+
         if tool == "web_search" and is_news and search_results:
             urls = [(item.get("url") or "").strip() for item in search_results]
             urls = [u for u in urls if u]
-            if urls:
+            if urls and not _has_source_links_block(assistant_text):
                 n = min(10, len(urls))
                 link_lines = [f"[{i}] {urls[i - 1]}" for i in range(1, n + 1)]
                 assistant_text = assistant_text.rstrip() + "\n\n" + "來源連結：\n" + "\n".join(link_lines)
