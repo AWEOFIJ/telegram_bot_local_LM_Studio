@@ -25,10 +25,44 @@ def _utc_datestr(ts: float | None = None) -> str:
 
 
 def _chat_id_from_request_id(request_id: str) -> str:
-    m = re.match(r"^chat(-?\d+)_", request_id.strip())
-    if not m:
+    rid = (request_id or "").strip()
+    if not rid:
         return "unknown"
-    return m.group(1)
+
+    # Common request_id formats in this repo:
+    # - chat<chat_id>_<ts>
+    # - spec<chat_id>_<ts>
+    # - tech<chat_id>_<ts>
+    # - gen<chat_id>_<ts>
+    m = re.match(r"^(?:chat|spec|tech|gen)[_-]?(-?\d+)(?:_|-)", rid)
+    if m:
+        return m.group(1)
+
+    # Allow embedded 'chat<id>_' anywhere (defensive).
+    m2 = re.search(r"chat[_-]?(-?\d+)(?:_|-)", rid)
+    if m2:
+        return m2.group(1)
+
+    # Last resort: extract a plausible chat id anywhere in the string.
+    # Telegram chat ids are typically 6+ digits (users) or negative for groups.
+    m3 = re.search(r"(-?\d{6,})", rid)
+    if m3:
+        return m3.group(1)
+
+    return "unknown"
+
+
+def _kind_from_request_id(request_id: str) -> str:
+    rid = (request_id or "").strip().lower()
+    if rid.startswith("spec"):
+        return "spec"
+    if rid.startswith("tech"):
+        return "tech"
+    if rid.startswith("gen"):
+        return "gen"
+    if rid.startswith("chat"):
+        return "chat"
+    return "misc"
 
 
 def _bucket_for_event_name(name: str) -> str:
@@ -96,7 +130,8 @@ class DebugLogger:
 
     def _ensure_dir(self, *, request_id: str) -> Path:
         chat_id = _chat_id_from_request_id(request_id)
-        d = Path(self.base_dir) / f"{_utc_datestr()}_chat" / str(chat_id)
+        kind = _kind_from_request_id(request_id)
+        d = Path(self.base_dir) / f"{_utc_datestr()}_chat" / str(chat_id) / kind
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -126,6 +161,14 @@ class DebugLogger:
 
         items.append(payload)
         fp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def debug_logger_from_settings(settings: Any) -> DebugLogger:
+    enabled = bool(getattr(settings, "debug", False))
+    base_dir = str(getattr(settings, "debug_dir", "debug") or "debug")
+    max_str = int(getattr(settings, "debug_max_str", 8000) or 8000)
+    max_list = int(getattr(settings, "debug_max_list", 50) or 50)
+    return DebugLogger(base_dir=base_dir, enabled=enabled, max_str=max_str, max_list=max_list)
 
 
 def debug_logger_from_env() -> DebugLogger:

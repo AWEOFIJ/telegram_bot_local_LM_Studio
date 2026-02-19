@@ -19,7 +19,7 @@ from .brave_search import BraveSearchClient
 from .config import Settings
 from .lmstudio import LMStudioClient, llm_plan_tools
 from .memory import MarkdownMemory
-from .debug_logger import debug_logger_from_env
+from .debug_logger import debug_logger_from_settings
 
 
 class _TextExtractor(HTMLParser):
@@ -440,6 +440,24 @@ def _profile_to_system_prompt(profile: dict[str, object]) -> str:
     return "Long-term user preferences:\n- " + "\n- ".join(lines)
 
 
+def _merge_adjacent_same_role(messages: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for m in messages:
+        role = str(m.get("role") or "")
+        content = str(m.get("content") or "")
+        if not role:
+            continue
+        if not merged:
+            merged.append({"role": role, "content": content})
+            continue
+        if merged[-1].get("role") == role:
+            prev = str(merged[-1].get("content") or "")
+            merged[-1]["content"] = (prev.rstrip() + "\n\n" + content.lstrip()).strip()
+        else:
+            merged.append({"role": role, "content": content})
+    return merged
+
+
 def _format_profile_text(profile: dict[str, object]) -> str:
     if not profile:
         return "目前沒有已儲存的長期記憶偏好。"
@@ -498,7 +516,19 @@ def _looks_simplified_chinese(text: str) -> bool:
 
 def _is_recent_news_query(user_text: str) -> bool:
     t = user_text.lower()
-    recent_markers = ["最近", "近日", "最新", "近幾日", "近几日", "這幾天", "这几天", "24小時", "24小时"]
+    recent_markers = [
+        "最近",
+        "近日",
+        "最新",
+        "近幾日",
+        "近几日",
+        "這幾天",
+        "这几天",
+        "24小時",
+        "24小时",
+        "今天",
+        "今日",
+    ]
     news_markers = [
         "新聞",
         "新闻",
@@ -575,6 +605,94 @@ def _extract_citation_indices(text: str, max_index: int) -> list[int]:
         seen.add(i)
         out.append(i)
     return out
+
+
+def _sanitize_non_numeric_citations(text: str) -> str:
+    # Models sometimes output placeholders like [n] / [n=1].
+    # Keep numeric citations like [1] intact.
+    return re.sub(r"\[(?:n|N)(?:=[^\]]+)?\]", "", text or "")
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # Strip common fenced code blocks: ```json ... ```
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n", "", s)
+        s = re.sub(r"\n```\s*$", "", s).strip()
+
+    start = s.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1].strip()
+
+    return None
+
+
+def _spec_index_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "project_name": {"type": "string"},
+            "tech_stack": {"type": "array", "items": {"type": "string"}},
+            "modules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                                },
+                                "required": ["id", "title", "depends_on", "acceptance_criteria", "priority"],
+                                "additionalProperties": True,
+                            },
+                        },
+                    },
+                    "required": ["name", "description", "tasks"],
+                    "additionalProperties": True,
+                },
+            },
+            "milestones": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["project_name", "tech_stack", "modules", "milestones", "open_questions"],
+        "additionalProperties": True,
+    }
 
 
 def _news_has_diverse_citations(text: str, max_index: int) -> bool:
@@ -988,7 +1106,7 @@ def _format_fetched_pages(pages: list[dict]) -> str:
 
 
 async def run_bot(settings: Settings) -> None:
-    dbg = debug_logger_from_env()
+    dbg = debug_logger_from_settings(settings)
 
     lm = LMStudioClient(settings.lmstudio_base_url, debug_logger=dbg)
     brave = BraveSearchClient(
@@ -1002,7 +1120,7 @@ async def run_bot(settings: Settings) -> None:
 
     import os
 
-    debug = os.environ.get("DEBUG", "").strip() in {"1", "true", "True", "yes", "YES"}
+    debug = bool(getattr(settings, "debug", False))
 
     fetch_top_n = int(getattr(settings, "fetch_top_n", 10) or 10)
     fetch_max_chars = int(getattr(settings, "fetch_max_chars", 8000) or 8000)
@@ -1146,39 +1264,73 @@ async def run_bot(settings: Settings) -> None:
             "Schema (keys): project_name (string), tech_stack (array of strings), modules (array of objects with name, description, tasks), milestones (array of strings), open_questions (array of strings). "
             "Each task is an object with id, title, depends_on (array), acceptance_criteria (array), priority (P0|P1|P2)."
         )
-        raw = await lm.chat_completions(
-            model=settings.lmstudio_chat_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": spec_text},
-            ],
-            temperature=0.1,
-            max_tokens=1800,
-            request_id=request_id,
-            response_format={"type": "json_object"},
-        )
+        spec_max_tokens = int(getattr(settings, "spec_parse_max_tokens", 6000) or 6000)
         try:
-            data = json.loads(raw)
+            raw = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": spec_text},
+                ],
+                temperature=0.1,
+                max_tokens=spec_max_tokens,
+                request_id=request_id,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "spec_index", "schema": _spec_index_schema()},
+                },
+            )
+        except httpx.HTTPStatusError:
+            raw = await lm.chat_completions(
+                model=settings.lmstudio_chat_model,
+                messages=[
+                    {"role": "system", "content": system + " Return JSON only."},
+                    {"role": "user", "content": spec_text},
+                ],
+                temperature=0.0,
+                max_tokens=spec_max_tokens,
+                request_id=request_id,
+            )
+        try:
+            candidate = _extract_first_json_object(raw) or raw
+            data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
         except Exception:
+            if dbg.enabled:
+                try:
+                    dbg.write_json(
+                        request_id=request_id,
+                        name="spec_parse_failed",
+                        data={"raw": (raw or "")[:8000]},
+                    )
+                except Exception:
+                    pass
             pass
 
+        compact_system = (
+            system
+            + " Keep output compact to fit token limits. "
+            + "Limit tasks per module to <= 8. "
+            + "Each acceptance_criteria array must have <= 3 short items. "
+            + "Descriptions must be <= 200 chars."
+        )
         retry = await lm.chat_completions(
             model=settings.lmstudio_chat_model,
             messages=[
                 {
                     "role": "system",
-                    "content": system + " Return JSON only. No prose.",
+                    "content": compact_system + " Return JSON only. No prose.",
                 },
                 {"role": "user", "content": spec_text},
             ],
             temperature=0.0,
-            max_tokens=1800,
+            max_tokens=min(spec_max_tokens, 9000),
             request_id=request_id,
         )
         try:
-            data = json.loads(retry)
+            candidate = _extract_first_json_object(retry) or retry
+            data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
         except Exception:
@@ -1314,10 +1466,35 @@ async def run_bot(settings: Settings) -> None:
             temperature=0.1,
             max_tokens=2200,
             request_id=request_id,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "gen_module_files",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "content": {"type": "string"},
+                                    },
+                                    "required": ["path", "content"],
+                                    "additionalProperties": True,
+                                },
+                            }
+                        },
+                        "required": ["files"],
+                        "additionalProperties": True,
+                    },
+                },
+            },
         )
         try:
-            obj = json.loads(raw)
+            candidate = _extract_first_json_object(raw) or raw
+            obj = json.loads(candidate)
         except Exception:
             obj = {}
         files = obj.get("files") if isinstance(obj, dict) else None
@@ -1410,6 +1587,36 @@ async def run_bot(settings: Settings) -> None:
         text = _format_profile_text(profile)
         await update.message.reply_text(text, disable_web_page_preview=True)
 
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            err = getattr(context, "error", None)
+            msg = str(err) if err else "(unknown error)"
+        except Exception:
+            msg = "(unknown error)"
+        if dbg.enabled:
+            try:
+                chat_id = None
+                try:
+                    chat_id = getattr(getattr(update, "effective_chat", None), "id", None) if update else None
+                except Exception:
+                    chat_id = None
+                rid = f"chat{chat_id}_{int(time.time()*1000)}" if chat_id is not None else f"err_{int(time.time()*1000)}"
+                dbg.write_json(
+                    request_id=rid,
+                    name="telegram_error",
+                    data={"error": msg},
+                )
+            except Exception:
+                pass
+        try:
+            if update and getattr(update, "effective_message", None):
+                await update.effective_message.reply_text(
+                    "處理訊息時發生錯誤，請稍後重試。若持續發生，請提供時間點與錯誤日誌。",
+                    disable_web_page_preview=True,
+                )
+        except Exception:
+            pass
+
     async def on_forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat or not update.message:
             return
@@ -1495,7 +1702,7 @@ async def run_bot(settings: Settings) -> None:
                     data={"chat_id": chat_id, "updates": profile_updates, "profile": profile},
                 )
 
-        plan = await llm_plan_tools(lm, model=settings.lmstudio_chat_model, user_text=user_text)
+        plan = await llm_plan_tools(lm, model=settings.lmstudio_planner_model, user_text=user_text)
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
 
@@ -1569,6 +1776,11 @@ async def run_bot(settings: Settings) -> None:
                         query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速 中央氣象署"
                     else:
                         query = f"{nloc} 今天 天氣預報 降雨機率 最高溫 最低溫 體感 風速"
+
+                # Bias "today" news queries toward recency.
+                is_today = any(k in user_text for k in ["今天", "今日"])
+                if (not is_weather) and is_news_like and is_today and not query:
+                    query = f"{user_text} 過去 24 小時"
 
                 if not is_weather and not query and _is_market_index_query(user_text):
                     if any(k in user_text.lower() for k in ["道瓊", "道琼", "dow jones", "djia"]):
@@ -1761,43 +1973,31 @@ async def run_bot(settings: Settings) -> None:
                     recent[chat_id].clear()
                     recent[chat_id].extend(turns_list[-keep_last:])
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful Telegram chatbot.",
-            },
-        ]
+        system_parts: list[str] = ["You are a helpful Telegram chatbot."]
         profile_prompt = _profile_to_system_prompt(profile)
         if profile_prompt:
-            messages.append({"role": "system", "content": profile_prompt})
+            system_parts.append(profile_prompt)
         lang = str(profile.get("preferred_language") or "").strip()
         if lang == "zh-Hant":
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Output language rule: reply in Traditional Chinese only unless user explicitly requests another language.",
-                }
+            system_parts.append(
+                "Output language rule: reply in Traditional Chinese only unless user explicitly requests another language."
             )
         elif lang == "zh-Hans":
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Output language rule: reply in Simplified Chinese only unless user explicitly requests another language.",
-                }
+            system_parts.append(
+                "Output language rule: reply in Simplified Chinese only unless user explicitly requests another language."
             )
         elif lang == "en":
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Output language rule: reply in English only unless user explicitly requests another language.",
-                }
+            system_parts.append(
+                "Output language rule: reply in English only unless user explicitly requests another language."
             )
+
+        messages: list[dict] = [{"role": "system", "content": "\n\n".join([p for p in system_parts if p.strip()]).strip()}]
 
         if tool == "web_search":
             if search_block:
                 messages.append(
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": (
                             "Web search results are provided. Use them first.\n"
                             "Do NOT paste URLs in the final answer. Use [n] citations only.\n"
@@ -1815,7 +2015,7 @@ async def run_bot(settings: Settings) -> None:
                     date_hint_lines = [f"[{i}] {source_date_hints.get(i, '[未提供日期]')}" for i in range(1, n + 1)]
                     messages.append(
                         {
-                            "role": "system",
+                            "role": "user",
                             "content": (
                                 "The user is asking for news. "
                                 f"You MUST list at least {n} distinct news items if sources are available. "
@@ -1833,7 +2033,7 @@ async def run_bot(settings: Settings) -> None:
                 if is_weather_q:
                     messages.append(
                         {
-                            "role": "system",
+                            "role": "user",
                             "content": (
                                 "This is a weather / real-time info question. You MUST use the provided web content to answer. "
                                 "Do NOT say you cannot provide real-time info. "
@@ -1850,7 +2050,7 @@ async def run_bot(settings: Settings) -> None:
                 if summaries_block:
                     messages.append(
                         {
-                            "role": "system",
+                            "role": "user",
                             "content": (
                                 "Per-source summaries are provided. Prefer using these summaries to answer. "
                                 "Cite sources with [n]. Do NOT include URLs.\n"
@@ -1861,7 +2061,7 @@ async def run_bot(settings: Settings) -> None:
                 elif fetched_block:
                     messages.append(
                         {
-                            "role": "system",
+                            "role": "user",
                             "content": (
                                 "Fetched page contents are provided. Prefer using these contents to answer. "
                                 "Cite sources with [n]. Do NOT include URLs.\n"
@@ -1872,7 +2072,7 @@ async def run_bot(settings: Settings) -> None:
             else:
                 messages.append(
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": "Web search was requested, but results are empty. Say you couldn't find sources, then answer from general knowledge.",
                     }
                 )
@@ -1880,9 +2080,15 @@ async def run_bot(settings: Settings) -> None:
         history_for_prompt = list(recent[chat_id])
         if tool == "web_search" and (is_weather_q or is_recent_news_q):
             # Avoid stale contamination from earlier assistant turns in recency-sensitive queries.
-            history_for_prompt = [m for m in history_for_prompt if m.get("role") == "user"][-3:]
+            user_only = [str(m.get("content") or "").strip() for m in history_for_prompt if m.get("role") == "user"]
+            user_only = [u for u in user_only if u]
+            if user_only:
+                history_for_prompt = [{"role": "user", "content": "\n\n".join(user_only[-3:]).strip()}]
+            else:
+                history_for_prompt = []
 
         messages.extend(history_for_prompt)
+        messages = _merge_adjacent_same_role(messages)
 
         if dbg.enabled:
             dbg.write_json(
@@ -1898,6 +2104,9 @@ async def run_bot(settings: Settings) -> None:
             max_tokens=900 if (tool == "web_search" and is_news) else None,
             request_id=request_id,
         )
+
+        if tool == "web_search" and is_news:
+            assistant_text = _sanitize_non_numeric_citations(assistant_text)
 
         if tool == "web_search" and is_weather_q and search_results and _is_weather_refusal(assistant_text):
             retry_messages = list(messages)
@@ -2183,6 +2392,7 @@ async def run_bot(settings: Settings) -> None:
     app.add_handler(CommandHandler("gen_module", on_gen_module_command))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     try:
         await app.initialize()

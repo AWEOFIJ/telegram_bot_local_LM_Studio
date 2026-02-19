@@ -1,0 +1,208 @@
+version: 1
+project:
+  name: telegram-lmstudio-brave-bot
+  description: >-
+    Telegram 對話機器人（Python），透過 LM Studio 本機模型回答問題；Bot 端可
+    使用 Brave Search 進行網路檢索並擷取網頁文字，提供可追溯來源的回答。
+
+goals:
+  - 在 Telegram 私聊/群組提供高可用的對話助理
+  - 針對時效性/需驗證問題（新聞、天氣）優先使用 web_search
+  - 提供短期記憶（markdown log）與長期偏好（profile.json）
+  - 支援 spec-driven 開發工作流：讀取 spec、技術檢索、模組產碼
+
+constraints:
+  runtime:
+    - python: ">=3.10"
+  security:
+    - prevent_path_traversal: true
+    - prevent_ssrf: true
+    - no_hardcoded_secrets: true
+  behavior:
+    - group_chat_requires_mention: true
+    - default_no_urls_in_answer: true
+
+env:
+  required:
+    - TELEGRAM_BOT_TOKEN
+    - BRAVE_API_KEY
+  optional:
+    - LMSTUDIO_BASE_URL
+    - LMSTUDIO_CHAT_MODEL
+    - BRAVE_COUNTRY
+    - BRAVE_LANG
+    - BRAVE_COUNT
+    - FETCH_TOP_N
+    - FETCH_MAX_CHARS
+    - MEMORY_DIR
+    - MEMORY_MODE
+    - MEMORY_DAYS
+    - RECENT_TURNS
+    - NEWS_FOLLOWUP_DEFAULT_COUNT
+    - NEWS_MAX_ITEMS
+    - MCP_BRAVE_ENABLED
+    - MCP_BRAVE_COMMAND
+    - MCP_BRAVE_ARGS
+
+modules:
+  - name: telegram_bot_core
+    description: Telegram handlers、群組點名策略、訊息路由與回覆。
+    tasks:
+      - id: TBC-001
+        title: 註冊 Telegram handlers（文字、文件、commands）
+        priority: P0
+        acceptance_criteria:
+          - Bot 可啟動並可接收私聊文字訊息
+          - 群組訊息未點名時不回覆
+      - id: TBC-002
+        title: 群組點名清理（strip leading mention）
+        priority: P1
+        acceptance_criteria:
+          - '@BotUsername 你好' 會正常回覆
+          - 未點名時直接 return
+
+  - name: llm_orchestration
+    description: tool planning、prompt 組裝、角色交替保護、語言偏好重寫。
+    tasks:
+      - id: LLM-001
+        title: 以 llm_plan_tools 決定是否 web_search
+        priority: P0
+        acceptance_criteria:
+          - 非時效問題可不搜尋
+          - 時效/需驗證問題可觸發 web_search
+      - id: LLM-002
+        title: 保證 messages role 交替（Gemma 相容）
+        priority: P0
+        acceptance_criteria:
+          - messages 送入 LM Studio 前不會出現連續 user 或連續 assistant
+          - system prompt 合併為單一 system
+      - id: LLM-003
+        title: 語言偏好與繁簡重寫
+        priority: P1
+        acceptance_criteria:
+          - preferred_language=zh-Hant 時輸出為繁中
+
+  - name: web_search_and_fetch
+    description: Brave 搜尋（HTTP/MCP）與全文擷取（httpx + HTML text extraction）。
+    tasks:
+      - id: WEB-001
+        title: BraveSearchClient（HTTP API）
+        priority: P0
+        acceptance_criteria:
+          - 提供 query/country/lang/count
+          - 回傳結果含 title/url/description
+      - id: WEB-002
+        title: MCP stdio（選用）呼叫 Brave Search
+        priority: P1
+        acceptance_criteria:
+          - MCP_BRAVE_ENABLED=1 時改用 MCP
+          - subprocess stderr 有 drain，避免 deadlock
+      - id: WEB-003
+        title: 網頁擷取與 SSRF 防護
+        priority: P0
+        acceptance_criteria:
+          - 不抓取 localhost/私網 IP
+          - 可限制最大字數（FETCH_MAX_CHARS）
+
+  - name: memory_and_profile
+    description: 短期記憶 markdown + 長期偏好 profile.json + 對話摘要。
+    tasks:
+      - id: MEM-001
+        title: Markdown 方式 append 記錄對話
+        priority: P0
+        acceptance_criteria:
+          - 每次 user/assistant turn 都會寫入 memory
+      - id: MEM-002
+        title: profile.json 長期偏好與 state
+        priority: P0
+        acceptance_criteria:
+          - 可記錄語言偏好/連結偏好/預設天氣地點
+          - 可維護 state（topic/entities/time_range 等）
+      - id: MEM-003
+        title: conversation_summary 自動摘要
+        priority: P1
+        acceptance_criteria:
+          - 對話過長時會摘要並注入 system prompt
+
+  - name: news_pipeline
+    description: 新聞查詢（今日/近期）、日期提示、引用一致、多來源保底輸出。
+    tasks:
+      - id: NEWS-001
+        title: 今日/近期新聞 query 模板（偏向 24 小時）
+        priority: P0
+        acceptance_criteria:
+          - '今天新聞' 會在 query 加上 '過去 24 小時'
+      - id: NEWS-002
+        title: 新聞輸出格式約束（日期 + 多來源 citation）
+        priority: P0
+        acceptance_criteria:
+          - 每則新聞條列，開頭含 YYYY-MM-DD 或 [未提供日期]
+          - 引用格式為 [1]/[2]…，不出現 [n]
+      - id: NEWS-003
+        title: deterministic fallback（逐來源摘要）
+        priority: P1
+        acceptance_criteria:
+          - 模型不遵守引用/日期時可產生穩定輸出
+      - id: NEWS-004
+        title: 來源連結區塊重建（引用對齊）
+        priority: P1
+        acceptance_criteria:
+          - 最終輸出來源連結僅包含被引用到的 URL
+
+  - name: weather_pipeline
+    description: 天氣查詢強制 web_search、拒答重試、結構化回覆。
+    tasks:
+      - id: WTH-001
+        title: 強制 web_search + location 抽取
+        priority: P0
+        acceptance_criteria:
+          - 未提供地點時會追問
+      - id: WTH-002
+        title: 拒答偵測與重試
+        priority: P1
+        acceptance_criteria:
+          - 若回答包含拒答語句，會重試一次
+
+  - name: spec_workflow
+    description: 規格驅動開發：上傳 spec、技術檢索、模組產碼、落盤到 memory。
+    tasks:
+      - id: SPEC-001
+        title: /read_spec 上傳 spec-kit.md 並解析成 spec_index.json
+        priority: P0
+        acceptance_criteria:
+          - 上傳後 memory/chat_<id>/spec/ 產生 spec_index.json
+      - id: SPEC-002
+        title: /spec_status 顯示模組/里程碑/開放問題
+        priority: P0
+        acceptance_criteria:
+          - 以精簡格式回覆
+      - id: SPEC-003
+        title: /search_tech 將 Brave 搜尋結果寫入 spec/tech/
+        priority: P1
+        acceptance_criteria:
+          - 每次搜尋會新增 JSON 檔
+      - id: SPEC-004
+        title: /gen_module 依 spec + tech notes 產生檔案到 spec/generated/
+        priority: P1
+        acceptance_criteria:
+          - 生成 JSON(files[]) 並安全寫檔
+
+milestones:
+  - id: M1
+    title: Bot 基礎對話 + LM Studio 串接
+  - id: M2
+    title: Brave web_search + fetch + 引用
+  - id: M3
+    title: Memory（短期 + 長期偏好）
+  - id: M4
+    title: 新聞/天氣強化（日期、引用一致、fallback）
+  - id: M5
+    title: 群組點名模式
+  - id: M6
+    title: Spec workflow（/read_spec /spec_status /search_tech /gen_module）
+
+open_questions:
+  - 今日新聞的時間窗要不要可配置（12h/24h/48h）？
+  - 新聞來源要不要剔除分類頁並偏好單篇文章 URL？
+  - 是否要針對國際/科技/體育/財經建立不同 query 與來源白名單？
+  - codegen 產物是否要可選擇寫入 repo 並提供 patch/apply 流程？
