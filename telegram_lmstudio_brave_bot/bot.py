@@ -213,6 +213,103 @@ def _strip_leading_bot_mention(user_text: str, bot_username: str) -> tuple[str, 
     return rest, True
 
 
+def _get_profile_state(profile: dict[str, object]) -> dict[str, object]:
+    state = profile.get("state")
+    if isinstance(state, dict):
+        return dict(state)
+    return {}
+
+
+def _profile_state_update(profile: dict[str, object], updates: dict[str, object]) -> dict[str, object]:
+    state = _get_profile_state(profile)
+    for k, v in updates.items():
+        if v is None:
+            state.pop(k, None)
+        else:
+            state[k] = v
+    return state
+
+
+def _is_time_question(user_text: str) -> bool:
+    t = (user_text or "").strip().lower()
+    keys = [
+        "今年",
+        "哪一年",
+        "幾年",
+        "今天",
+        "哪一天",
+        "幾號",
+        "幾月",
+        "星期幾",
+        "禮拜幾",
+        "礼拜几",
+        "日期",
+        "date",
+        "year",
+        "day of week",
+    ]
+    return any(k in t for k in keys)
+
+
+def _answer_time_question(user_text: str) -> str:
+    t = (user_text or "").strip().lower()
+    now = time.localtime()
+    y, mo, d = now.tm_year, now.tm_mon, now.tm_mday
+    dow_map = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    dow = dow_map[now.tm_wday % 7]
+
+    if "今年" in t or "哪一年" in t or "幾年" in t or "year" in t:
+        return f"今年是 {y} 年。"
+    if "星期" in t or "禮拜" in t or "礼拜" in t or "day of week" in t:
+        return f"今天是 {y} 年 {mo} 月 {d} 日，{dow}。"
+    if "今天" in t or "哪一天" in t or "幾號" in t or "日期" in t or "date" in t:
+        return f"今天是 {y} 年 {mo} 月 {d} 日，{dow}。"
+    return f"今天是 {y} 年 {mo} 月 {d} 日，{dow}。"
+
+
+def _is_low_quality_news_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u.startswith("http"):
+        return True
+    host = _domain(u)
+    path = ""
+    try:
+        path = urlparse(u).path or ""
+    except Exception:
+        path = ""
+
+    bad_hosts = {
+        "apps.apple.com",
+        "play.google.com",
+        "sj.qq.com",
+        "m.baidu.com",
+    }
+    if host in bad_hosts:
+        return True
+
+    bad_path_markers = [
+        "/search",
+        "/tag",
+        "/tagging",
+        "/topics",
+        "/section/",
+        "/sections/",
+        "/category/",
+        "/categories/",
+        "/topic/",
+    ]
+    if any(p in (path or "").lower() for p in bad_path_markers):
+        return True
+
+    if host.endswith("wikipedia.org"):
+        return True
+
+    if len((path or "").strip("/")) == 0:
+        return True
+
+    return False
+
+
 async def _summarize_conversation_for_profile(
     lm: LMStudioClient,
     *,
@@ -303,6 +400,20 @@ def _profile_to_system_prompt(profile: dict[str, object]) -> str:
     if convo_summary:
         lines.append("Conversation summary (for context, do not repeat verbatim unless asked):")
         lines.append(convo_summary)
+
+    state = profile.get("state")
+    if isinstance(state, dict):
+        topic = str(state.get("topic") or "").strip()
+        entities = state.get("entities")
+        time_range = str(state.get("time_range") or "").strip()
+        if topic:
+            lines.append(f"Current topic: {topic}.")
+        if isinstance(entities, list) and entities:
+            safe_entities = [str(e).strip() for e in entities if str(e).strip()]
+            if safe_entities:
+                lines.append("Current entities: " + ", ".join(safe_entities) + ".")
+        if time_range:
+            lines.append(f"Current time range: {time_range}.")
 
     if not lines:
         return ""
@@ -923,6 +1034,28 @@ async def run_bot(settings: Settings) -> None:
             if not user_text:
                 return
 
+        # Deterministic time/date answers (do not ask the LLM).
+        if _is_time_question(user_text):
+            assistant_text = _answer_time_question(user_text)
+            state = _profile_state_update(profile={}, updates={"topic": "time", "time_range": "today"})
+            try:
+                existing_profile = await memory.get_profile(chat_id=chat_id)
+                state = _profile_state_update(existing_profile, {"topic": "time", "time_range": "today", "last_tool": "deterministic_time"})
+                await memory.upsert_profile(chat_id=chat_id, updates={"state": state})
+            except Exception:
+                pass
+
+            if dbg.enabled:
+                dbg.write_json(
+                    request_id=f"chat{chat_id}_{int(time.time()*1000)}",
+                    name="deterministic_time_answer",
+                    data={"chat_id": chat_id, "user_text": user_text, "assistant_text": assistant_text},
+                )
+            recent[chat_id].append({"role": "assistant", "content": assistant_text})
+            await memory.add_turn(chat_id=chat_id, role="assistant", content=assistant_text, ts=time.time())
+            await update.message.reply_text(assistant_text, disable_web_page_preview=True)
+            return
+
         request_id = f"chat{chat_id}_{int(time.time()*1000)}"
         if dbg.enabled:
             dbg.write_json(
@@ -960,6 +1093,21 @@ async def run_bot(settings: Settings) -> None:
         plan = await llm_plan_tools(lm, model=settings.lmstudio_chat_model, user_text=user_text)
         tool = (plan.get("tool") or "none").strip()
         query = (plan.get("query") or "").strip()
+
+        is_news_like = any(
+            k in user_text.lower()
+            for k in [
+                "新聞",
+                "新闻",
+                "news",
+                "頭條",
+                "头条",
+                "最近",
+                "近日",
+                "最新",
+                "headline",
+            ]
+        )
 
         # A) Follow-up continuation: reuse last web_search context for news.
         is_followup = _is_followup_continue(user_text)
@@ -1034,6 +1182,12 @@ async def run_bot(settings: Settings) -> None:
                     )
                 except Exception:
                     search_results = []
+
+            # Light source-quality filtering for company/news queries.
+            if tool == "web_search" and is_news_like and search_results:
+                filtered = [r for r in search_results if not _is_low_quality_news_url(str(r.get("url") or ""))]
+                if filtered:
+                    search_results = filtered
 
             if dbg.enabled and is_followup and prev_ctx.get("tool") == "web_search" and bool(prev_ctx.get("is_news")):
                 dbg.write_json(
@@ -1122,6 +1276,53 @@ async def run_bot(settings: Settings) -> None:
         )
         is_recent_news_q = _is_recent_news_query(user_text)
         source_date_hints, allowed_news_dates = _build_source_date_hints(search_results, fetched_pages)
+
+        # Persist state into profile.json (topic/entities/time_range/last_tool/last_query/digest)
+        entities: list[str] = []
+        tl = user_text.lower()
+        if any(k in tl for k in ["輝達", "英偉達", "nvidia"]):
+            entities.append("NVIDIA")
+        if any(k in tl for k in ["百度", "baidu", "bidu"]):
+            entities.append("Baidu")
+        time_range = ""
+        if any(k in user_text for k in ["今天", "今日"]):
+            time_range = "today"
+        elif any(k in user_text for k in ["最近", "近日", "最新"]):
+            time_range = "recent"
+
+        state_updates: dict[str, object] = {}
+        if is_news_like:
+            state_updates["topic"] = "news"
+        if entities:
+            state_updates["entities"] = entities
+        if time_range:
+            state_updates["time_range"] = time_range
+        if tool:
+            state_updates["last_tool"] = tool
+        if tool == "web_search":
+            state_updates["last_query"] = (query or user_text).strip()
+            digest_lines: list[str] = []
+            for i, r in enumerate(search_results[: min(10, len(search_results))], start=1):
+                title = str(r.get("title") or "").strip()
+                url = str(r.get("url") or "").strip()
+                if not title:
+                    title = "(untitled)"
+                digest_lines.append(f"[{i}] {title} ({_domain(url)})")
+            if digest_lines:
+                state_updates["last_results_digest"] = "\n".join(digest_lines)
+
+        if state_updates:
+            try:
+                new_state = _profile_state_update(profile, state_updates)
+                profile = await memory.upsert_profile(chat_id=chat_id, updates={"state": new_state})
+                if dbg.enabled:
+                    dbg.write_json(
+                        request_id=request_id,
+                        name="profile_state_updated",
+                        data={"chat_id": chat_id, "state": new_state},
+                    )
+            except Exception:
+                pass
 
         # B) Conversation summarization to profile when context is long.
         try:
