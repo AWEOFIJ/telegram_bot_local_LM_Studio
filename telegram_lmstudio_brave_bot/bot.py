@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import ipaddress
 import time
 import logging
@@ -232,23 +233,42 @@ def _profile_state_update(profile: dict[str, object], updates: dict[str, object]
 
 def _is_time_question(user_text: str) -> bool:
     t = (user_text or "").strip().lower()
-    keys = [
-        "今年",
-        "哪一年",
-        "幾年",
-        "今天",
-        "哪一天",
-        "幾號",
-        "幾月",
-        "星期幾",
-        "禮拜幾",
-        "礼拜几",
-        "日期",
-        "date",
-        "year",
-        "day of week",
+
+    # Avoid false positives like "今天新聞" / "今天國際新聞".
+    news_markers = [
+        "新聞",
+        "新闻",
+        "焦點",
+        "焦点",
+        "頭條",
+        "头条",
+        "國際",
+        "国际",
+        "體育",
+        "体育",
+        "賽事",
+        "赛事",
+        "要聞",
+        "要闻",
     ]
-    return any(k in t for k in keys)
+    if any(k in t for k in news_markers):
+        return False
+
+    # Year questions.
+    if any(k in t for k in ["今年", "哪一年", "幾年", "year"]):
+        return True
+
+    # Explicit day-of-week questions.
+    if any(k in t for k in ["星期幾", "禮拜幾", "礼拜几", "day of week"]):
+        return True
+
+    # Explicit date questions (require more than just "今天").
+    if re.search(r"(今天|今日).*(哪一天|幾號|几号|幾月|日期|星期|禮拜|礼拜|date)", t):
+        return True
+    if any(k in t for k in ["哪一天", "幾號", "几号", "幾月", "日期", "date"]):
+        return True
+
+    return False
 
 
 def _answer_time_question(user_text: str) -> str:
@@ -996,6 +1016,391 @@ async def run_bot(settings: Settings) -> None:
     )
     recent: dict[int, deque[dict]] = defaultdict(lambda: deque(maxlen=settings.recent_turns * 2))
     last_web_context: dict[int, dict[str, object]] = {}
+    pending_spec_upload: set[int] = set()
+
+    def _spec_dir(chat_id: int) -> str:
+        return os.path.join(settings.memory_dir, f"chat_{chat_id}", "spec")
+
+    def _safe_slug(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", "-", s)
+        s = re.sub(r"[^a-z0-9\-_.]+", "", s)
+        s = re.sub(r"-+", "-", s).strip("-._")
+        return s or "item"
+
+    def _tech_dir(chat_id: int) -> str:
+        return os.path.join(_spec_dir(chat_id), "tech")
+
+    def _generated_dir(chat_id: int) -> str:
+        return os.path.join(_spec_dir(chat_id), "generated")
+
+    def _read_spec_index(chat_id: int) -> dict[str, object] | None:
+        path = os.path.join(_spec_dir(chat_id), "spec_index.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _format_spec_status(spec: dict[str, object]) -> str:
+        project_name = str(spec.get("project_name") or "").strip()
+        modules = spec.get("modules")
+        milestones = spec.get("milestones")
+        open_q = spec.get("open_questions")
+
+        lines: list[str] = []
+        if project_name:
+            lines.append(f"專案：{project_name}")
+
+        if isinstance(modules, list) and modules:
+            lines.append("\n模組：")
+            for m in modules[:12]:
+                name = str((m or {}).get("name") or "").strip() if isinstance(m, dict) else ""
+                desc = str((m or {}).get("description") or "").strip() if isinstance(m, dict) else ""
+                if not name:
+                    continue
+                if desc:
+                    lines.append(f"- {name}：{desc}")
+                else:
+                    lines.append(f"- {name}")
+
+        if isinstance(milestones, list) and milestones:
+            lines.append("\nMilestones：")
+            for ms in milestones[:8]:
+                t = str(ms or "").strip()
+                if t:
+                    lines.append(f"- {t}")
+
+        if isinstance(open_q, list) and open_q:
+            lines.append("\n待釐清問題：")
+            for q in open_q[:10]:
+                t = str(q or "").strip()
+                if t:
+                    lines.append(f"- {t}")
+
+        if not lines:
+            return "目前沒有可顯示的 spec 狀態。"
+        return "\n".join(lines).strip()
+
+    def _extract_command_args(update: Update, command: str) -> str:
+        if not update.message or not update.message.text:
+            return ""
+        t = update.message.text.strip()
+        # command can be /cmd or /cmd@bot
+        t = re.sub(rf"^/{re.escape(command)}(?:@\w+)?\s*", "", t, flags=re.IGNORECASE)
+        return t.strip()
+
+    def _safe_join(base: str, rel_path: str) -> str | None:
+        rel = (rel_path or "").replace("\\", "/").lstrip("/")
+        if not rel or rel.startswith("..") or "/../" in rel:
+            return None
+        full = os.path.normpath(os.path.join(base, rel))
+        base_norm = os.path.normpath(base)
+        if os.path.commonpath([base_norm, full]) != base_norm:
+            return None
+        return full
+
+    def _load_recent_tech_notes(chat_id: int, limit: int = 3) -> str:
+        d = _tech_dir(chat_id)
+        try:
+            files = [
+                os.path.join(d, fn)
+                for fn in os.listdir(d)
+                if fn.lower().endswith(".json")
+            ]
+        except Exception:
+            return ""
+        if not files:
+            return ""
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        parts: list[str] = []
+        for p in files[:limit]:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+            except Exception:
+                continue
+            q = str(obj.get("query") or "").strip()
+            results = obj.get("results")
+            if not isinstance(results, list):
+                continue
+            lines = []
+            for i, r in enumerate(results[:5], start=1):
+                if not isinstance(r, dict):
+                    continue
+                title = str(r.get("title") or "").strip() or "(untitled)"
+                url = str(r.get("url") or "").strip()
+                lines.append(f"[{i}] {title} - {url}")
+            if lines:
+                head = f"Query: {q}" if q else f"Tech notes: {os.path.basename(p)}"
+                parts.append(head + "\n" + "\n".join(lines))
+        return "\n\n".join(parts).strip()
+
+    async def _parse_spec_to_index(*, spec_text: str, request_id: str) -> dict[str, object] | None:
+        system = (
+            "You are an AI software architect. Convert the provided spec-kit.md into a JSON object only. "
+            "Output MUST be valid JSON (no markdown). "
+            "Schema (keys): project_name (string), tech_stack (array of strings), modules (array of objects with name, description, tasks), milestones (array of strings), open_questions (array of strings). "
+            "Each task is an object with id, title, depends_on (array), acceptance_criteria (array), priority (P0|P1|P2)."
+        )
+        raw = await lm.chat_completions(
+            model=settings.lmstudio_chat_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": spec_text},
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+            request_id=request_id,
+            response_format={"type": "json_object"},
+        )
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        retry = await lm.chat_completions(
+            model=settings.lmstudio_chat_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system + " Return JSON only. No prose.",
+                },
+                {"role": "user", "content": spec_text},
+            ],
+            temperature=0.0,
+            max_tokens=1800,
+            request_id=request_id,
+        )
+        try:
+            data = json.loads(retry)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    async def on_read_spec_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        pending_spec_upload.add(chat_id)
+        await update.message.reply_text(
+            "請上傳 spec-kit.md 檔案（文件）。上傳後我會解析並建立任務清單。",
+            disable_web_page_preview=True,
+        )
+
+    async def on_spec_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        spec = _read_spec_index(chat_id)
+        if not spec:
+            await update.message.reply_text("尚未讀取 spec。請先使用 /read_spec 並上傳 spec-kit.md。", disable_web_page_preview=True)
+            return
+        await update.message.reply_text(_format_spec_status(spec), disable_web_page_preview=True)
+
+    async def on_search_tech_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        keyword = _extract_command_args(update, "search_tech")
+        if not keyword:
+            await update.message.reply_text("用法：/search_tech <關鍵字>", disable_web_page_preview=True)
+            return
+
+        request_id = f"tech{chat_id}_{int(time.time()*1000)}"
+        try:
+            results = await brave.web_search(
+                query=keyword,
+                country=settings.brave_country,
+                lang=settings.brave_lang,
+                count=int(getattr(settings, "brave_count", 10) or 10),
+                request_id=request_id,
+            )
+        except Exception:
+            results = []
+
+        os.makedirs(_tech_dir(chat_id), exist_ok=True)
+        out_path = os.path.join(_tech_dir(chat_id), f"{int(time.time())}_{_safe_slug(keyword)[:48]}.json")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({"query": keyword, "results": results}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        lines: list[str] = [f"已儲存技術檢索：{keyword}"]
+        if results:
+            lines.append("\n前幾筆來源：")
+            for i, r in enumerate(results[:5], start=1):
+                title = str((r or {}).get("title") or "").strip() if isinstance(r, dict) else ""
+                url = str((r or {}).get("url") or "").strip() if isinstance(r, dict) else ""
+                if not title:
+                    title = "(untitled)"
+                if url:
+                    lines.append(f"[{i}] {title}\n{url}")
+                else:
+                    lines.append(f"[{i}] {title}")
+        else:
+            lines.append("（沒有取得結果，或來源被阻擋）")
+
+        await update.message.reply_text("\n".join(lines).strip(), disable_web_page_preview=True)
+
+    async def on_gen_module_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message:
+            return
+        chat_id = update.effective_chat.id
+        module_name = _extract_command_args(update, "gen_module")
+        if not module_name:
+            await update.message.reply_text("用法：/gen_module <模組名>", disable_web_page_preview=True)
+            return
+
+        spec = _read_spec_index(chat_id)
+        if not spec:
+            await update.message.reply_text("尚未讀取 spec。請先使用 /read_spec 並上傳 spec-kit.md。", disable_web_page_preview=True)
+            return
+
+        modules = spec.get("modules")
+        if not isinstance(modules, list) or not modules:
+            await update.message.reply_text("spec_index.json 內沒有 modules。", disable_web_page_preview=True)
+            return
+
+        target: dict[str, object] | None = None
+        for m in modules:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or "").strip()
+            if name and name.lower() == module_name.strip().lower():
+                target = m
+                break
+        if not target:
+            # fuzzy contains
+            for m in modules:
+                if not isinstance(m, dict):
+                    continue
+                name = str(m.get("name") or "").strip()
+                if name and module_name.strip().lower() in name.lower():
+                    target = m
+                    break
+        if not target:
+            await update.message.reply_text("找不到指定模組。你可以用 /spec_status 查看模組名稱。", disable_web_page_preview=True)
+            return
+
+        tech_notes = _load_recent_tech_notes(chat_id, limit=3)
+        request_id = f"gen{chat_id}_{int(time.time()*1000)}"
+        system = (
+            "You are a senior engineer. Generate project files for the given module. "
+            "Return JSON only with keys: files (array). Each file item must have: path (relative path), content (string). "
+            "Do not include markdown fences. Paths must be relative and must not contain '..'. "
+            "Keep code minimal and runnable, prefer Python when unsure."
+        )
+        user_payload = {
+            "project_name": spec.get("project_name"),
+            "tech_stack": spec.get("tech_stack"),
+            "module": target,
+            "tech_notes": tech_notes,
+        }
+        raw = await lm.chat_completions(
+            model=settings.lmstudio_chat_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            max_tokens=2200,
+            request_id=request_id,
+            response_format={"type": "json_object"},
+        )
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = {}
+        files = obj.get("files") if isinstance(obj, dict) else None
+        if not isinstance(files, list) or not files:
+            await update.message.reply_text("生成失敗：沒有產出 files。", disable_web_page_preview=True)
+            return
+
+        base_out = os.path.join(_generated_dir(chat_id), _safe_slug(str(target.get("name") or module_name)))
+        os.makedirs(base_out, exist_ok=True)
+        written: list[str] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            rel_path = str(item.get("path") or "").strip()
+            content = str(item.get("content") or "")
+            full = _safe_join(base_out, rel_path)
+            if not full:
+                continue
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            try:
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(content)
+                written.append(os.path.relpath(full, _spec_dir(chat_id)).replace("\\", "/"))
+            except Exception:
+                continue
+
+        if not written:
+            await update.message.reply_text("生成失敗：檔案路徑不合法或寫入失敗。", disable_web_page_preview=True)
+            return
+
+        msg_lines = ["已產生模組檔案：", *[f"- {p}" for p in written[:30]]]
+        if len(written) > 30:
+            msg_lines.append(f"...（共 {len(written)} 個檔案）")
+        await update.message.reply_text("\n".join(msg_lines), disable_web_page_preview=True)
+
+    async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.message or not update.message.document:
+            return
+        chat_id = update.effective_chat.id
+        if chat_id not in pending_spec_upload:
+            return
+
+        doc = update.message.document
+        filename = str(getattr(doc, "file_name", "") or "").strip() or "spec-kit.md"
+        if not filename.lower().endswith((".md", ".markdown", ".txt")):
+            await update.message.reply_text("請上傳 .md / .markdown / .txt 格式的規格書檔案。", disable_web_page_preview=True)
+            return
+
+        request_id = f"spec{chat_id}_{int(time.time()*1000)}"
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            data = await tg_file.download_as_bytearray()
+            spec_text = bytes(data).decode("utf-8", errors="replace")
+        except Exception:
+            await update.message.reply_text("下載 spec 檔案失敗，請稍後重試。", disable_web_page_preview=True)
+            return
+
+        spec_text = spec_text.strip()
+        if not spec_text:
+            await update.message.reply_text("spec 檔案內容是空的，請確認後再上傳。", disable_web_page_preview=True)
+            return
+
+        os.makedirs(_spec_dir(chat_id), exist_ok=True)
+        try:
+            with open(os.path.join(_spec_dir(chat_id), filename), "w", encoding="utf-8") as f:
+                f.write(spec_text)
+        except Exception:
+            pass
+
+        spec_index = await _parse_spec_to_index(spec_text=spec_text, request_id=request_id)
+        if not spec_index:
+            await update.message.reply_text("解析 spec 失敗（JSON 產出不合法）。請嘗試縮短 spec 或分段上傳。", disable_web_page_preview=True)
+            return
+
+        try:
+            with open(os.path.join(_spec_dir(chat_id), "spec_index.json"), "w", encoding="utf-8") as f:
+                json.dump(spec_index, f, ensure_ascii=False, indent=2)
+        except Exception:
+            await update.message.reply_text("寫入 spec_index.json 失敗。", disable_web_page_preview=True)
+            return
+
+        pending_spec_upload.discard(chat_id)
+        await update.message.reply_text(_format_spec_status(spec_index), disable_web_page_preview=True)
 
     async def on_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat or not update.message:
@@ -1772,6 +2177,11 @@ async def run_bot(settings: Settings) -> None:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("memory", on_memory_command))
     app.add_handler(CommandHandler("forget", on_forget_command))
+    app.add_handler(CommandHandler("read_spec", on_read_spec_command))
+    app.add_handler(CommandHandler("spec_status", on_spec_status_command))
+    app.add_handler(CommandHandler("search_tech", on_search_tech_command))
+    app.add_handler(CommandHandler("gen_module", on_gen_module_command))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     try:
